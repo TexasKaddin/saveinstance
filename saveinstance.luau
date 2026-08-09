@@ -2934,7 +2934,9 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field BoostFPS boolean -- Massively boosts FPS by disabling 3D rendering. Other options also enable it, like: SafeMode. ___Default:___ false
 --- @field ShutdownWhenDone boolean -- Shuts the game down after saveinstance is finished. ___Default:___ false
 --- @field AntiIdle boolean -- Prevents the 20-minute-Idle Kick. ___Default:___ true
---- @field SaveTerrain boolean -- Saves Workspace.Terrain voxel data when the serializer can recover Terrain.SmoothGrid. Uses multiple compatibility fallbacks, including Terrain:CopyRegion(). ___Default:___ true
+--- @field SaveTerrain boolean -- Saves terrain using ReadVoxels when SmoothGrid cannot be read. The saved place contains a small restore Script that rebuilds the terrain with WriteVoxels when the place starts. ___Default:___ true
+--- @field TerrainChunkSize number -- Terrain scan chunk size in studs. Must be a multiple of 4. ___Default:___ 64
+--- @field TerrainMaxChunks number -- Safety limit for terrain chunks scanned/saved. ___Default:___ 20000
 --- .Anonymous {boolean|table{UserId = string, Name = string}} -- * **RISKY:** Cleans the file of any info related to your account like: Name, UserId. This is useful for some games that might store that info in GUIs or other Instances. Might potentially mess up parts of strings that contain characters that match your Name or parts of numbers that match your UserId. Can also be a table with UserId & Name keys. ___Default:___ false
 --- @field ShowStatus boolean -- ___Default:___ true
 --- @field Callback function -- If set, the serialized data will be sent to the callback function instead of to file. ___Default:___ false
@@ -3083,6 +3085,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		ShutdownWhenDone = false,
 		AntiIdle = true,
 		SaveTerrain = true,
+		TerrainChunkSize = 64,
+		TerrainMaxChunks = 20000,
 		Anonymous = false,
 		ReadMe = true,
 		FilePath = false,
@@ -3406,10 +3410,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	local SaveTerrain = OPTIONS.SaveTerrain
-	if SaveTerrain then
-		IgnoreProperties.SmoothGrid = true
-		IgnoreProperties.PhysicsGrid = true
-	end
+	local TerrainChunkSize = tonumber(OPTIONS.TerrainChunkSize) or 64
+	local TerrainMaxChunks = tonumber(OPTIONS.TerrainMaxChunks) or 20000
+	TerrainChunkSize = math.max(16, math.floor(TerrainChunkSize / 4) * 4)
+	TerrainMaxChunks = math.max(1, math.floor(TerrainMaxChunks))
+	local TerrainRestoreSource
 
 	local IgnoreDefaultProperties = OPTIONS.IgnoreDefaultProperties
 	local IgnoreNotArchivable = not OPTIONS.IgnoreNotArchivable
@@ -3978,126 +3983,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return raw
 	end
 
-	local terrainGridCache = setmetatable({}, { __mode = "k" })
-
-	local function readTerrainBinaryProperty(instance, propertyName)
-		local function tryGetter(getter)
-			if type(getter) ~= "function" then
-				return nil
-			end
-
-			local ok, value = pcall(getter, instance, propertyName)
-			if ok and type(value) == "string" then
-				return value
-			end
-
-			return nil
-		end
-
-		-- Prefer the method detected by UniversalMethodFinder. This remains available
-		-- even when the serializer disables its local gethiddenproperty for safety.
-		local value = tryGetter(global_container and global_container.gethiddenproperty)
-		if value ~= nil then
-			return value
-		end
-
-		-- UGCValidationService:GetPropertyValue fallback used by the main serializer.
-		value = tryGetter(gethiddenproperty_fallback)
-		if value ~= nil then
-			return value
-		end
-
-		-- Some executors expose property-table helpers instead of a working
-		-- gethiddenproperty implementation.
-		local env = GLOBAL_ENV or _G
-
-		local function tryPropertyTableGetter(getter)
-			if type(getter) ~= "function" then
-				return nil
-			end
-
-			local ok, properties = pcall(getter, instance)
-			if ok and type(properties) == "table" then
-				local result = properties[propertyName]
-				if type(result) == "string" then
-					return result
-				end
-			end
-
-			return nil
-		end
-
-		value = tryPropertyTableGetter(env and env.gethiddenproperties)
-			or tryPropertyTableGetter(env and env.getproperties)
-
-		return value
-	end
-
-	local function captureTerrainGrids(terrain)
-		local cached = terrainGridCache[terrain]
-		if cached then
-			return cached
-		end
-
-		local result = {
-			SmoothGrid = readTerrainBinaryProperty(terrain, "SmoothGrid"),
-			PhysicsGrid = readTerrainBinaryProperty(terrain, "PhysicsGrid"),
-		}
-
-		-- If Terrain itself hides the voxel BinaryString from this executor,
-		-- ask Roblox to snapshot the terrain into a TerrainRegion and try the
-		-- same property readers against the snapshot.
-		if result.SmoothGrid == nil then
-			local ok, terrainRegion = pcall(function()
-				return terrain:CopyRegion(terrain.MaxExtents)
-			end)
-
-			if ok and terrainRegion then
-				result.SmoothGrid = readTerrainBinaryProperty(terrainRegion, "SmoothGrid")
-				result.PhysicsGrid = result.PhysicsGrid
-					or readTerrainBinaryProperty(terrainRegion, "PhysicsGrid")
-
-				pcall(function()
-					terrainRegion:Destroy()
-				end)
-			end
-		end
-
-		terrainGridCache[terrain] = result
-		return result
-	end
-
 	local function ReturnItem(className, instance)
-		local item = '<Item class="' .. className .. '" referent="' .. getRef(instance) .. '"><Properties>'
-
-		if SaveTerrain and className == "Terrain" then
-			local grids = captureTerrainGrids(instance)
-			local smoothGrid = grids.SmoothGrid
-			local physicsGrid = grids.PhysicsGrid
-
-			if type(smoothGrid) == "string" and smoothGrid ~= "" then
-				item ..= '<BinaryString name="SmoothGrid">'
-					.. XML_Encoders.BinaryString(smoothGrid)
-					.. '</BinaryString>'
-			elseif pcall(function()
-				return instance:CountCells()
-			end) then
-				local ok, count = pcall(instance.CountCells, instance)
-				if ok and count > 0 then
-					warn("[Terrain] Terrain exists, but SmoothGrid could not be read by this executor.")
-				end
-			end
-
-			-- PhysicsGrid is used by some older place formats. It is optional on
-			-- newer clients, so only include it when the executor can actually read it.
-			if type(physicsGrid) == "string" and physicsGrid ~= "" then
-				item ..= '<BinaryString name="PhysicsGrid">'
-					.. XML_Encoders.BinaryString(physicsGrid)
-					.. '</BinaryString>'
-			end
-		end
-
-		return item
+		return '<Item class="' .. className .. '" referent="' .. getRef(instance) .. '"><Properties>' -- TODO: Ideally this shouldn't return <Properties> as well as the line below to close it IF  IgnorePropertiesOfNotScriptsOnScriptsMode is Enabled OR If all properties are default (reduces file size by at least 1.4%)
 	end
 
 	local function ReturnProperty(tag, propertyName, value)
@@ -4144,6 +4031,298 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 		inheritedProperties[className] = prop_list
 		return prop_list
+	end
+
+
+	local function BuildTerrainRestoreSource()
+		if not SaveTerrain then
+			return nil
+		end
+
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+		if not terrain then
+			return nil
+		end
+
+		local chunkStuds = TerrainChunkSize
+		local voxelResolution = 4
+		local voxelsPerAxis = chunkStuds / voxelResolution
+		local maxChunks = TerrainMaxChunks
+
+		local queue = {}
+		local queueIndex = 1
+		local queued = {}
+		local chunks = {}
+		local materialsByName = {}
+		local materialNames = {}
+
+		local function chunkKey(x, y, z)
+			return tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+		end
+
+		local function enqueueChunk(cx, cy, cz)
+			local key = chunkKey(cx, cy, cz)
+			if queued[key] then
+				return
+			end
+			queued[key] = true
+			queue[#queue + 1] = { cx, cy, cz }
+		end
+
+		local function enqueuePosition(position)
+			enqueueChunk(
+				math.floor(position.X / chunkStuds),
+				math.floor(position.Y / chunkStuds),
+				math.floor(position.Z / chunkStuds)
+			)
+		end
+
+		-- Multiple seeds make disconnected terrain much more likely to be discovered.
+		enqueuePosition(Vector3.zero)
+
+		local camera = workspace.CurrentCamera
+		if camera then
+			enqueuePosition(camera.CFrame.Position)
+		end
+
+		for _, player in service.Players:GetPlayers() do
+			local character = player.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root then
+				enqueuePosition(root.Position)
+			end
+		end
+
+		-- Seed chunks around map geometry. This catches separate islands/areas of terrain
+		-- that are not connected to the player's current terrain component.
+		local descendants = workspace:GetDescendants()
+		for i = 1, #descendants do
+			local instance = descendants[i]
+			if instance:IsA("BasePart") and instance ~= terrain then
+				enqueuePosition(instance.Position)
+			end
+		end
+
+		local function getMaterialId(material)
+			local name = material.Name
+			local id = materialsByName[name]
+			if not id then
+				id = #materialNames + 1
+				materialsByName[name] = id
+				materialNames[id] = name
+			end
+			return id
+		end
+
+		local scanned = 0
+		local hitLimit = false
+
+		while queueIndex <= #queue do
+			if scanned >= maxChunks then
+				hitLimit = true
+				break
+			end
+
+			local chunk = queue[queueIndex]
+			queueIndex += 1
+			scanned += 1
+
+			local cx, cy, cz = chunk[1], chunk[2], chunk[3]
+			local min = Vector3.new(cx * chunkStuds, cy * chunkStuds, cz * chunkStuds)
+			local max = min + Vector3.new(chunkStuds, chunkStuds, chunkStuds)
+			local region = Region3.new(min, max):ExpandToGrid(voxelResolution)
+
+			local ok, voxelMaterials, occupancies = pcall(terrain.ReadVoxels, terrain, region, voxelResolution)
+			if ok and voxelMaterials and occupancies then
+				local records = {}
+				local recordCount = 0
+				local hasTerrain = false
+
+				for x = 1, voxelsPerAxis do
+					local materialX = voxelMaterials[x]
+					local occupancyX = occupancies[x]
+
+					for y = 1, voxelsPerAxis do
+						local materialY = materialX[y]
+						local occupancyY = occupancyX[y]
+
+						for z = 1, voxelsPerAxis do
+							local material = materialY[z]
+							local occupancy = occupancyY[z]
+
+							if material ~= Enum.Material.Air and occupancy and occupancy > 0 then
+								hasTerrain = true
+
+								local linearIndex =
+									((x - 1) * voxelsPerAxis * voxelsPerAxis)
+									+ ((y - 1) * voxelsPerAxis)
+									+ z
+
+								local materialId = getMaterialId(material)
+								local occupancyByte = math.clamp(math.floor(occupancy * 255 + 0.5), 1, 255)
+
+								recordCount += 1
+								records[recordCount] =
+									tostring(linearIndex)
+									.. ","
+									.. tostring(materialId)
+									.. ","
+									.. tostring(occupancyByte)
+							end
+						end
+					end
+				end
+
+				if hasTerrain then
+					chunks[#chunks + 1] = {
+						x = min.X,
+						y = min.Y,
+						z = min.Z,
+						data = table.concat(records, ";"),
+					}
+
+					-- Flood-fill only out of occupied chunks. This is much faster than
+					-- scanning a giant rectangular world volume.
+					enqueueChunk(cx + 1, cy, cz)
+					enqueueChunk(cx - 1, cy, cz)
+					enqueueChunk(cx, cy + 1, cz)
+					enqueueChunk(cx, cy - 1, cz)
+					enqueueChunk(cx, cy, cz + 1)
+					enqueueChunk(cx, cy, cz - 1)
+				end
+			end
+
+			if scanned % 100 == 0 then
+				if StatusText then
+					StatusText.Text =
+						"Reading Terrain.. Chunks: "
+						.. tostring(scanned)
+						.. " Saved: "
+						.. tostring(#chunks)
+				end
+				wait_for_render()
+			end
+		end
+
+		if hitLimit then
+			warn(
+				"[Terrain] TerrainMaxChunks limit reached ("
+					.. tostring(maxChunks)
+					.. "). Increase TerrainMaxChunks if terrain is missing."
+			)
+		end
+
+		if #chunks == 0 then
+			local ok, count = pcall(terrain.CountCells, terrain)
+			if ok and count > 0 then
+				warn("[Terrain] Terrain exists, but the ReadVoxels scan did not find any occupied chunks.")
+			end
+			return nil
+		end
+
+		local source = table.create(#chunks + 32)
+		local n = 0
+
+		local function add(value)
+			n += 1
+			source[n] = value
+		end
+
+		add("local terrain = workspace.Terrain\n")
+		add("local RESOLUTION = 4\n")
+		add("local CHUNK_STUDS = " .. tostring(chunkStuds) .. "\n")
+		add("local N = " .. tostring(voxelsPerAxis) .. "\n")
+		add("local materials = {\n")
+
+		for i = 1, #materialNames do
+			add("	Enum.Material." .. materialNames[i] .. ",\n")
+		end
+
+		add("}\n")
+		add("local chunks = {\n")
+
+		for i = 1, #chunks do
+			local chunk = chunks[i]
+			add(
+				"	{"
+					.. tostring(chunk.x)
+					.. ","
+					.. tostring(chunk.y)
+					.. ","
+					.. tostring(chunk.z)
+					.. ",[=["
+					.. chunk.data
+					.. "]=]},\n"
+			)
+		end
+
+		add("}\n")
+		add([[
+local AIR = Enum.Material.Air
+
+local function makeArrays()
+	local mats = table.create(N)
+	local occ = table.create(N)
+
+	for x = 1, N do
+		local mx = table.create(N)
+		local ox = table.create(N)
+		mats[x] = mx
+		occ[x] = ox
+
+		for y = 1, N do
+			local my = table.create(N, AIR)
+			local oy = table.create(N, 0)
+			mx[y] = my
+			ox[y] = oy
+		end
+	end
+
+	return mats, occ
+end
+
+for chunkIndex, chunk in ipairs(chunks) do
+	local mats, occ = makeArrays()
+	local encoded = chunk[4]
+
+	for linear, materialId, occupancyByte in string.gmatch(encoded, "(%d+),(%d+),(%d+)") do
+		local index = tonumber(linear) - 1
+		local x = math.floor(index / (N * N)) + 1
+		index = index % (N * N)
+		local y = math.floor(index / N) + 1
+		local z = (index % N) + 1
+
+		mats[x][y][z] = materials[tonumber(materialId)]
+		occ[x][y][z] = tonumber(occupancyByte) / 255
+	end
+
+	local min = Vector3.new(chunk[1], chunk[2], chunk[3])
+	local region = Region3.new(
+		min,
+		min + Vector3.new(CHUNK_STUDS, CHUNK_STUDS, CHUNK_STUDS)
+	):ExpandToGrid(RESOLUTION)
+
+	terrain:WriteVoxels(region, RESOLUTION, mats, occ)
+
+	if chunkIndex % 25 == 0 then
+		task.wait()
+	end
+end
+
+if script and script.Parent then
+	script:Destroy()
+end
+]])
+
+		print(
+			"[Terrain] ReadVoxels backup created: "
+				.. tostring(#chunks)
+				.. " occupied chunks, "
+				.. tostring(#materialNames)
+				.. " materials."
+		)
+
+		return table.concat(source)
 	end
 
 	local function save_cache()
@@ -4580,6 +4759,16 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				end
 			end
 
+			if SaveTerrain and TerrainRestoreSource and instance == workspace then
+				savebuffer[savebuffer_size] = save_specific("Script", {
+					Name = "__USSI_TerrainRestore",
+					Source = TerrainRestoreSource,
+				})
+				savebuffer_size += 1
+				savebuffer[savebuffer_size] = "</Item>"
+				savebuffer_size += 1
+			end
+
 			if DecompileIgnoring and DecompileIgnoring == instance then
 				DecompileIgnoring = nil
 			end
@@ -4648,6 +4837,15 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			or (IsolateLocalPlayer or IsolateLocalPlayerCharacter) and IsolateLocalPlayer
 			or IsolatePlayers
 			or NilInstances and global_container.getnilinstances -- ! Make sure this accurately reflects everything below
+
+		if SaveTerrain then
+			local ok, result = pcall(BuildTerrainRestoreSource)
+			if ok then
+				TerrainRestoreSource = result
+			else
+				warn("[Terrain] ReadVoxels backup failed:", result)
+			end
+		end
 
 		save_hierarchy(ToSaveList)
 
