@@ -2937,6 +2937,10 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field SaveTerrain boolean -- Saves terrain using ReadVoxels when SmoothGrid cannot be read. The saved place contains a small restore Script that rebuilds the terrain with WriteVoxels when the place starts. ___Default:___ true
 --- @field TerrainChunkSize number -- Terrain scan chunk size in studs. Must be a multiple of 4. ___Default:___ 64
 --- @field TerrainMaxChunks number -- Safety limit for terrain chunks scanned/saved. ___Default:___ 20000
+--- @field TerrainAutoStream boolean -- Automatically requests streamed regions while the terrain flood-fill progresses, so you do not need to walk the map manually. ___Default:___ true
+--- @field TerrainStreamStep number -- Size in studs of each cached streaming focus cell. Smaller values are slower but more aggressive. ___Default:___ 256
+--- @field TerrainStreamTimeout number -- Timeout passed to Player:RequestStreamAroundAsync(). ___Default:___ 5
+--- @field TerrainStreamSettle number -- Extra delay after a new streaming request before reading terrain. ___Default:___ 0.15
 --- .Anonymous {boolean|table{UserId = string, Name = string}} -- * **RISKY:** Cleans the file of any info related to your account like: Name, UserId. This is useful for some games that might store that info in GUIs or other Instances. Might potentially mess up parts of strings that contain characters that match your Name or parts of numbers that match your UserId. Can also be a table with UserId & Name keys. ___Default:___ false
 --- @field ShowStatus boolean -- ___Default:___ true
 --- @field Callback function -- If set, the serialized data will be sent to the callback function instead of to file. ___Default:___ false
@@ -3087,6 +3091,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		SaveTerrain = true,
 		TerrainChunkSize = 64,
 		TerrainMaxChunks = 20000,
+		TerrainAutoStream = true,
+		TerrainStreamStep = 256,
+		TerrainStreamTimeout = 5,
+		TerrainStreamSettle = 0.15,
 		Anonymous = false,
 		ReadMe = true,
 		FilePath = false,
@@ -3412,6 +3420,13 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local SaveTerrain = OPTIONS.SaveTerrain
 	local TerrainChunkSize = tonumber(OPTIONS.TerrainChunkSize) or 64
 	local TerrainMaxChunks = tonumber(OPTIONS.TerrainMaxChunks) or 20000
+	local TerrainAutoStream = OPTIONS.TerrainAutoStream ~= false
+	local TerrainStreamStep = tonumber(OPTIONS.TerrainStreamStep) or 256
+	local TerrainStreamTimeout = tonumber(OPTIONS.TerrainStreamTimeout) or 5
+	local TerrainStreamSettle = tonumber(OPTIONS.TerrainStreamSettle) or 0.15
+	TerrainStreamStep = math.max(64, math.floor(TerrainStreamStep / 4) * 4)
+	TerrainStreamTimeout = math.max(0, TerrainStreamTimeout)
+	TerrainStreamSettle = math.max(0, TerrainStreamSettle)
 	TerrainChunkSize = math.max(16, math.floor(TerrainChunkSize / 4) * 4)
 	TerrainMaxChunks = math.max(1, math.floor(TerrainMaxChunks))
 	local TerrainRestoreSource
@@ -4114,6 +4129,71 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			return id
 		end
 
+
+		local streamPlayer = service.Players.LocalPlayer
+		local streamedFocusCells = {}
+		local streamRequests = 0
+
+		local streamY = 0
+		if streamPlayer then
+			local character = streamPlayer.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root then
+				streamY = root.Position.Y
+			elseif workspace.CurrentCamera then
+				streamY = workspace.CurrentCamera.CFrame.Position.Y
+			end
+		end
+
+		local function requestTerrainStream(position)
+			if not TerrainAutoStream or not streamPlayer then
+				return
+			end
+
+			-- Cache requests in larger X/Z focus cells. A 64-stud terrain chunk does
+			-- not need its own network request when a nearby focus was already loaded.
+			local fx = math.floor(position.X / TerrainStreamStep)
+			local fz = math.floor(position.Z / TerrainStreamStep)
+			local key = tostring(fx) .. "," .. tostring(fz)
+
+			if streamedFocusCells[key] then
+				return
+			end
+			streamedFocusCells[key] = true
+			streamRequests += 1
+
+			local focus = Vector3.new(
+				(fx + 0.5) * TerrainStreamStep,
+				streamY,
+				(fz + 0.5) * TerrainStreamStep
+			)
+
+			if StatusText then
+				StatusText.Text =
+					"Streaming Terrain.. Request "
+					.. tostring(streamRequests)
+					.. " | Saved chunks: "
+					.. tostring(#chunks)
+			end
+
+			local ok, err = pcall(
+				streamPlayer.RequestStreamAroundAsync,
+				streamPlayer,
+				focus,
+				TerrainStreamTimeout
+			)
+
+			if not ok then
+				warn("[Terrain] RequestStreamAroundAsync failed at", focus, err)
+			end
+
+			if TerrainStreamSettle > 0 then
+				task.wait(TerrainStreamSettle)
+			else
+				wait_for_render()
+			end
+		end
+
 		local scanned = 0
 		local hitLimit = false
 
@@ -4131,6 +4211,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			local min = Vector3.new(cx * chunkStuds, cy * chunkStuds, cz * chunkStuds)
 			local max = min + Vector3.new(chunkStuds, chunkStuds, chunkStuds)
 			local region = Region3.new(min, max):ExpandToGrid(voxelResolution)
+
+			requestTerrainStream((min + max) * 0.5)
 
 			local ok, voxelMaterials, occupancies = pcall(terrain.ReadVoxels, terrain, region, voxelResolution)
 			if ok and voxelMaterials and occupancies then
@@ -4199,6 +4281,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						.. tostring(scanned)
 						.. " Saved: "
 						.. tostring(#chunks)
+						.. " Stream requests: "
+						.. tostring(streamRequests)
 				end
 				wait_for_render()
 			end
@@ -4319,7 +4403,9 @@ end
 				.. tostring(#chunks)
 				.. " occupied chunks, "
 				.. tostring(#materialNames)
-				.. " materials."
+				.. " materials, "
+				.. tostring(streamRequests)
+				.. " streaming requests."
 		)
 
 		return table.concat(source)
