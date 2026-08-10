@@ -1,6 +1,13 @@
 --!native
 --!optimize 2
 --!divine-intellect
+-- Property patch compatibility audit:
+-- https://github.com/Dekkonot/rbx-instance-serializer/blob/master/src/API.lua
+-- https://github.com/MaximumADHD/Roblox-File-Format
+-- https://github.com/rojo-rbx/rbx-dom/blob/master/rbx_dom_lua/src/customProperties.lua
+-- https://github.com/rojo-rbx/rbx-dom/tree/master/patches
+-- Full API Dump audit keywords: XML, Internal, Serialize
+-- PropertyPatchesDumper is available as a saveinstance option.
 -- https://discord.gg/wx4ThpAsmw
 
 local function string_find(s, pattern, init)
@@ -1229,18 +1236,43 @@ do
 	XML_Encoders[encoderName] = XML_Encoders[redirectName]
 end
 
-local ClassList, FetchAPI
+local ClassList, FetchAPI, PropertyPatchReport
+local PropertyPatchHeuristicsEnabled = true
 
 do
 	local ClassPropertyExceptions = arrayToDict({
 		Whitelist = {
-			MeshPart = { "CollisionFidelity" },
-			PartOperation = { "CollisionFidelity" },
-			TriangleMeshPart = { "CollisionFidelity" },
+			MeshPart = {
+				"CollisionFidelity",
+				"FluidFidelity",
+				"MeshContent",
+				"MeshId",
+				"TextureContent",
+				"TextureID",
+				"RenderFidelity",
+				"DoubleSided",
+			},
+			PartOperation = {
+				"CollisionFidelity",
+				"RenderFidelity",
+				"SmoothingAngle",
+				"UsePartColor",
+			},
+			TriangleMeshPart = {
+				"CollisionFidelity",
+				"FluidFidelity",
+			},
 		},
 		Blacklist = {
 			LuaSourceContainer = { "ScriptGuid" },
 			Instance = { "UniqueId", "HistoryId" },
+
+			-- Serialization duplicates / legacy descriptors.
+			-- The canonical file properties are CFrame, Color3uint8, size,
+			-- formFactorRaw and BackgroundTransparency.
+			BasePart = { "Position", "Rotation", "Orientation", "BrickColor", "brickColor" },
+			FormFactorPart = { "FormFactor", "formFactor" },
+			GuiObject = { "Transparency" },
 		},
 	}, true)
 
@@ -2224,7 +2256,40 @@ do
 		},
 		PartOperation = {
 			Content = function(instance)
-				return Content.fromUri(gethiddenproperty_fallback(instance, "AssetId"))
+				local value
+				for _, propertyName in { "Content", "AssetId", "AssetID" } do
+					local ok, result = pcall(index, instance, propertyName)
+					if ok and result ~= nil then
+						value = result
+						break
+					end
+
+					if gethiddenproperty then
+						ok, result = pcall(gethiddenproperty, instance, propertyName)
+						if ok and result ~= nil then
+							value = result
+							break
+						end
+					end
+
+					if gethiddenproperty_fallback then
+						ok, result = pcall(gethiddenproperty_fallback, instance, propertyName)
+						if ok and result ~= nil then
+							value = result
+							break
+						end
+					end
+				end
+
+				if typeof(value) == "Content" then
+					return value
+				end
+
+				if type(value) == "string" and value ~= "" then
+					return Content.fromUri(value)
+				end
+
+				return __BREAK
 			end,
 			InitialSize = "MeshSize",
 		},
@@ -2460,6 +2525,243 @@ do
 	end
 
 	NotScriptableFixes.Workspace.CollisionGroupData = NotScriptableFixes.WorldRoot.CollisionGroupData -- TODO Remove once v732 goes live
+
+
+	-- Property patch compatibility layer.
+	--
+	-- Sources used to maintain this table:
+	-- Dekkonot/rbx-instance-serializer src/API.lua
+	-- MaximumADHD/Roblox-File-Format PropertyPatches
+	-- rojo-rbx/rbx-dom customProperties.lua + patches/*
+	--
+	-- Exact Full API Dump metadata and PreferredDescriptorName still take
+	-- priority. These mappings are fallback readers for clients/executors
+	-- where the serialized descriptor itself cannot be read directly.
+
+	local function ensureFixClass(className)
+		local fixes = NotScriptableFixes[className]
+		if not fixes then
+			fixes = {}
+			NotScriptableFixes[className] = fixes
+		end
+		return fixes
+	end
+
+	local function addAliasFix(className, serializedName, readableName)
+		local fixes = ensureFixClass(className)
+		if fixes[serializedName] == nil then
+			fixes[serializedName] = readableName
+		end
+	end
+
+	local function makeContentMigrationReader(legacyPropertyName)
+		return function(instance)
+			local ok, value = pcall(index, instance, legacyPropertyName)
+			if not ok or value == nil then
+				return __BREAK
+			end
+
+			if typeof(value) == "Content" then
+				return value
+			end
+
+			if type(value) == "string" then
+				if value == "" then
+					return Content.fromUri("")
+				end
+
+				local convertedOk, converted = pcall(Content.fromUri, value)
+				if convertedOk then
+					return converted
+				end
+			end
+
+			return __BREAK
+		end
+	end
+
+	local function addContentMigration(className, serializedContentName, legacyPropertyName)
+		local fixes = ensureFixClass(className)
+		if fixes[serializedContentName] == nil then
+			fixes[serializedContentName] = makeContentMigrationReader(legacyPropertyName)
+		end
+	end
+
+	-- Direct descriptor redirects from Roblox file-format property patches.
+	local SERIALIZED_ALIAS_FIXES = {
+		-- Explicit serializer aliases confirmed by the existing USSI fixes,
+		-- rbx-dom SerializesAs patches, or Roblox-File-Format backing names.
+		BallSocketConstraint = {
+			MaxFrictionTorqueXml = "MaxFrictionTorque",
+		},
+		BasePart = {
+			MaterialVariantSerialized = "MaterialVariant",
+			Color3uint8 = "Color",
+			size = "Size",
+			siz = "Size",
+		},
+		DoubleConstrainedValue = {
+			value = "Value",
+		},
+		IntConstrainedValue = {
+			value = "Value",
+		},
+		Fire = {
+			heat_xml = "Heat",
+			size_xml = "Size",
+		},
+		FormFactorPart = {
+			formFactorRaw = "FormFactor",
+		},
+		Humanoid = {
+			Health_XML = "Health",
+		},
+		MaterialService = {
+			Use2022MaterialsXml = "Use2022Materials",
+		},
+		Part = {
+			shape = "Shape",
+			shap = "Shape",
+		},
+		Smoke = {
+			size_xml = "Size",
+			opacity_xml = "Opacity",
+			riseVelocity_xml = "RiseVelocity",
+		},
+		Sound = {
+			-- rbx-dom currently serializes RollOffMinDistance as EmitterSize,
+			-- while older files may use xmlRead_MinDistance_3.
+			EmitterSize = "RollOffMinDistance",
+			xmlRead_MinDistance_3 = "RollOffMinDistance",
+			xmlRead_MaxDistance_3 = "RollOffMaxDistance",
+		},
+		Sparkles = {
+			SparkleColor = "Color",
+		},
+		StarterPlayer = {
+			AvatarJointUpgrade_SerializedRollout = "AvatarJointUpgrade",
+		},
+		TrussPart = {
+			style = "Style",
+		},
+		WeldConstraint = {
+			Part0Internal = "Part0",
+			Part1Internal = "Part1",
+		},
+		Workspace = {
+			SignalBehavior2 = "SignalBehavior",
+		},
+	}
+
+	for className, aliases in SERIALIZED_ALIAS_FIXES do
+		for serializedName, readableName in aliases do
+			addAliasFix(className, serializedName, readableName)
+		end
+	end
+
+	-- ContentId -> Content migrations used by newer place/model files.
+	-- These only run when the modern serialized property cannot be read.
+	local CONTENT_MIGRATIONS = {
+		AdGui = {
+			FallbackImageContent = "FallbackImage",
+		},
+		Animation = {
+			AnimationContent = "AnimationId",
+		},
+		AudioPlayer = {
+			AudioContent = "Asset",
+		},
+		BackpackItem = {
+			TextureContent = "TextureId",
+		},
+		Beam = {
+			TextureContent = "Texture",
+		},
+		ClickDetector = {
+			CursorIconContent = "CursorIcon",
+		},
+		DragDetector = {
+			ActivatedCursorIconContent = "ActivatedCursorIcon",
+		},
+		Decal = {
+			TextureContent = "Texture",
+			MetalnessMapContent = "MetalnessMap",
+			NormalMapContent = "NormalMap",
+			RoughnessMapContent = "RoughnessMap",
+			ColorMapContent = "ColorMap",
+		},
+		FileMesh = {
+			MeshContent = "MeshId",
+			TextureContent = "TextureId",
+		},
+		ImageButton = {
+			ImageContent = "Image",
+			HoverImageContent = "HoverImage",
+			PressedImageContent = "PressedImage",
+		},
+		ImageLabel = {
+			ImageContent = "Image",
+		},
+		ImageHandleAdornment = {
+			ImageContent = "Image",
+		},
+		MaterialVariant = {
+			RoughnessMapContent = "RoughnessMap",
+			NormalMapContent = "NormalMap",
+			MetalnessMapContent = "MetalnessMap",
+			ColorMapContent = "ColorMap",
+		},
+		MeshPart = {
+			MeshContent = "MeshId",
+			TextureContent = "TextureID",
+		},
+		Mouse = {
+			IconContent = "Icon",
+		},
+		Sound = {
+			AudioContent = "SoundId",
+		},
+		SurfaceAppearance = {
+			RoughnessMapContent = "RoughnessMap",
+			NormalMapContent = "NormalMap",
+			MetalnessMapContent = "MetalnessMap",
+			ColorMapContent = "ColorMap",
+		},
+		TerrainDetail = {
+			RoughnessMapContent = "RoughnessMap",
+			NormalMapContent = "NormalMap",
+			MetalnessMapContent = "MetalnessMap",
+			ColorMapContent = "ColorMap",
+		},
+		Sky = {
+			SunTextureContent = "SunTextureId",
+			MoonTextureContent = "MoonTextureId",
+			SkyboxFrontContent = "SkyboxFt",
+			SkyboxDownContent = "SkyboxDn",
+			SkyboxLeftContent = "SkyboxLf",
+			SkyboxBackContent = "SkyboxBk",
+			SkyboxUpContent = "SkyboxUp",
+			SkyboxRightContent = "SkyboxRt",
+		},
+		Trail = {
+			TextureContent = "Texture",
+		},
+		VideoFrame = {
+			VideoContent = "Video",
+		},
+		BaseWrap = {
+			CageMeshContent = "CageMeshId",
+		},
+		WrapLayer = {
+			ReferenceMeshContent = "ReferenceMeshId",
+		},
+	}
+
+	for className, migrations in CONTENT_MIGRATIONS do
+		for serializedContentName, legacyPropertyName in migrations do
+			addContentMigration(className, serializedContentName, legacyPropertyName)
+		end
+	end
 
 	FetchAPI = function()
 		-- Credits @MaximumADHD
@@ -2751,6 +3053,145 @@ do
 			tmp_classDict[ClassName] = props
 		end
 
+
+		local function getTagInfo(memberTags)
+			local preferredDescriptorName
+			local notScriptable = false
+
+			if memberTags then
+				for _, tag in memberTags do
+					if type(tag) == "table" then
+						preferredDescriptorName = tag.PreferredDescriptorName or preferredDescriptorName
+					elseif tag == "NotScriptable" then
+						notScriptable = true
+					end
+				end
+			end
+
+			return preferredDescriptorName, notScriptable
+		end
+
+		local function inferSerializedDescriptor(className, propertyName, valueTypeName)
+			local classDict = tmp_classDict[className]
+			if not classDict then
+				return nil
+			end
+
+			local candidates = {}
+			local seen = {}
+
+			local function addCandidate(name)
+				if not name or name == "" or name == propertyName or seen[name] then
+					return
+				end
+				seen[name] = true
+				candidates[#candidates + 1] = name
+			end
+
+			-- Common backing-property naming conventions found in Full API Dumps.
+			addCandidate(string.match(propertyName, "^(.-)_XML$"))
+			addCandidate(string.match(propertyName, "^(.-)_xml$"))
+			addCandidate(string.match(propertyName, "^(.-)Xml$"))
+			addCandidate(string.match(propertyName, "^(.-)Internal$"))
+			addCandidate(string.match(propertyName, "^(.-)Serialize$"))
+			addCandidate(string.match(propertyName, "^(.-)Serialized$"))
+			addCandidate(string.match(propertyName, "^(.-)_SerializedRollout$"))
+			addCandidate(string.match(propertyName, "^(.-)Raw$"))
+
+			-- Legacy XML descriptors are frequently the lower-case spelling of
+			-- the script-facing property: size -> Size, shape -> Shape, etc.
+			local first = string.sub(propertyName, 1, 1)
+			if first ~= "" then
+				addCandidate(string.upper(first) .. string.sub(propertyName, 2))
+			end
+
+			local matched
+			for _, candidateName in candidates do
+				local candidate = classDict[candidateName]
+				if
+					candidate
+					and candidate.MemberType == "Property"
+					and candidate.ValueType == valueTypeName
+				then
+					if matched and matched ~= candidateName then
+						-- Ambiguous: do not guess.
+						return nil
+					end
+					matched = candidateName
+				end
+			end
+
+			return matched
+		end
+
+		-- PropertyPatchesDumper:
+		-- Search the exact Full API Dump for names containing XML, Internal,
+		-- Serialize/Serialized and record descriptor aliases/fixes.
+		do
+			local suspicious = {}
+
+			for _, API_Class in API_Dump_Decoded do
+				local className = API_Class.Name
+				local classFixes = NotScriptableFixes[className]
+
+				for _, member in API_Class.Members do
+					if member.MemberType == "Property" then
+						local propertyName = member.Name
+						local lowered = string.lower(propertyName)
+
+						if
+							string.find(lowered, "xml", 1, true)
+							or string.find(lowered, "internal", 1, true)
+							or string.find(lowered, "serialize", 1, true)
+						then
+							local preferred, notScriptable = getTagInfo(member.Tags)
+							local inferred = inferSerializedDescriptor(
+								className,
+								propertyName,
+								member.ValueType and member.ValueType.Name
+							)
+
+							local explicitFix = classFixes and classFixes[propertyName]
+							local explicitFixName
+							if type(explicitFix) == "string" then
+								explicitFixName = explicitFix
+							elseif type(explicitFix) == "function" then
+								explicitFixName = "<function>"
+							end
+
+							local serialization = member.Serialization or {}
+
+							suspicious[#suspicious + 1] = {
+								Class = className,
+								Property = propertyName,
+								ValueType = member.ValueType and member.ValueType.Name or "Unknown",
+								CanSave = serialization.CanSave == true,
+								CanLoad = serialization.CanLoad == true,
+								NotScriptable = notScriptable,
+								PreferredDescriptorName = preferred,
+								InferredDescriptorName = inferred,
+								ExplicitFix = explicitFixName,
+							}
+						end
+					end
+				end
+			end
+
+			table.sort(suspicious, function(a, b)
+				if a.Class == b.Class then
+					return a.Property < b.Property
+				end
+				return a.Class < b.Class
+			end)
+
+			PropertyPatchReport = {
+				ClientVersion = FULL_VERSION,
+				Keywords = { "XML", "Internal", "Serialize" },
+				Count = #suspicious,
+				Properties = suspicious,
+			}
+		end
+
 		-- Second pass (actual)
 		for _, API_Class in API_Dump_Decoded do
 			local ClassProperties, ClassProperties_size = {}, 1
@@ -2841,6 +3282,17 @@ do
 								end
 							end
 
+							local NotScriptableFix = NotScriptableFixClass and NotScriptableFixClass[PropertyName]
+
+							if
+								PropertyPatchHeuristicsEnabled
+								and not PreferredDescriptorName
+								and not NotScriptableFix
+							then
+								PreferredDescriptorName =
+									inferSerializedDescriptor(ClassName, PropertyName, ValueType_Name)
+							end
+
 							local preferredDescriptorProp
 							if PreferredDescriptorName then
 								preferredDescriptorProp = tmp_classDict[ClassName][PreferredDescriptorName]
@@ -2874,7 +3326,6 @@ do
 								Property.Optional = string.sub(ValueType_Name, 9)
 							end
 
-							local NotScriptableFix = NotScriptableFixClass and NotScriptableFixClass[PropertyName]
 							local accessFunc = PreferredDescriptorName
 								and (
 									preferredDescriptorProp.MemberType == "Property"
@@ -2978,6 +3429,12 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field IgnoreSharedStrings boolean -- * **RISKY**: Might help with crashes on some executors. ___Default:___ false
 --- @field SharedStringOverwrite boolean -- * **RISKY:** if the process is not finished aka crashed then none of the affected values will be available. SharedStrings can also be used for ValueTypes that aren't `SharedString`, this behavior is not documented anywhere but makes sense (Could create issues though, due to _potential_ ValueType mix-up, only works on certain types which are all base64 encoded so far). Reason: Allows for potential smaller file size (can also be bigger in some cases). ___Default:___ false
 --- @field TreatUnionsAsParts boolean -- * **RISKY:** Converts all UnionOperations to Parts. Useful if your Executor isn't able to save (read) Unions, because otherwise they will be invisible. ___Default:___ false (except Solara)
+--- @field PreservePartOperationGeometry boolean -- Tries modern + legacy property paths to preserve UnionOperation/NegateOperation/IntersectOperation geometry. ___Default:___ true
+--- @field UnionFallbackToPart boolean -- If a PartOperation geometry reference cannot be recovered, saves a BasePart-shaped placeholder instead of an invisible/broken union. ___Default:___ true
+--- @field PreferModernMeshContent boolean -- Prefers MeshContent/TextureContent for MeshParts, with legacy ID fallbacks. Useful on newer Roblox clients where MeshId is restricted. ___Default:___ true
+--- @field FixTriangleMeshCollisions boolean -- Writes CollisionFidelity=Default for MeshParts/PartOperations to avoid broken collision data in the copied place. ___Default:___ true
+--- @field PropertyPatchHeuristics boolean -- Uses conservative Full-Dump name heuristics for backing descriptors such as *_XML, *Internal, *Serialize, *Serialized, *_SerializedRollout and lower-case XML aliases. ___Default:___ true
+--- @field PropertyPatchesDumper boolean|string -- Writes a JSON report of Full API Dump properties containing XML, Internal or Serialize. Set true for an automatic filename, or provide a .json filename. ___Default:___ false
 
 --- @interface OptionsAliases
 --- @within SynSaveInstance
@@ -3147,6 +3604,12 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		IgnoreSharedStrings = false,
 		SharedStringOverwrite = false,
 		TreatUnionsAsParts = false,
+		PreservePartOperationGeometry = true,
+		UnionFallbackToPart = true,
+		PreferModernMeshContent = true,
+		FixTriangleMeshCollisions = true,
+		PropertyPatchHeuristics = true,
+		PropertyPatchesDumper = false,
 		AlternativeWritefile = not arrayToDict({ "WRD", "Xeno", "Zorara" })[EXECUTOR_NAME],
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
@@ -3302,6 +3765,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	end
 
+	PropertyPatchHeuristicsEnabled = OPTIONS.PropertyPatchHeuristics ~= false
+
 	if not writefile and not OPTIONS.Callback then
 		-- appendfile could be used a fallback but what kind of exec has appendfile without writefile
 		local function coreCall(method, ...)
@@ -3443,6 +3908,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local SaveNotCreatable = OPTIONS.SaveNotCreatable
 	local TreatUnionsAsParts = OPTIONS.TreatUnionsAsParts
+	local PreservePartOperationGeometry = OPTIONS.PreservePartOperationGeometry ~= false
+	local UnionFallbackToPart = OPTIONS.UnionFallbackToPart ~= false
+	local PreferModernMeshContent = OPTIONS.PreferModernMeshContent ~= false
+	local FixTriangleMeshCollisions = OPTIONS.FixTriangleMeshCollisions ~= false
 
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
@@ -3883,6 +4352,114 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		end
 		return InstanceOverride
+	end
+
+
+	local function getOrCreateInstanceOverride(instance)
+		local override = InstancesOverrides[instance]
+		if not override then
+			override = { Properties = {} }
+			InstancesOverrides[instance] = override
+		elseif not override.Properties then
+			override.Properties = {}
+		end
+		return override
+	end
+
+	local function tryReadPropertyCompat(instance, propertyName)
+		local ok, value = pcall(index, instance, propertyName)
+		if ok and value ~= nil then
+			return value
+		end
+
+		if gethiddenproperty then
+			ok, value = pcall(gethiddenproperty, instance, propertyName)
+			if ok and value ~= nil then
+				return value
+			end
+		end
+
+		if gethiddenproperty_fallback then
+			ok, value = pcall(gethiddenproperty_fallback, instance, propertyName)
+			if ok and value ~= nil then
+				return value
+			end
+		end
+
+		return nil
+	end
+
+	local function normalizeContent(value)
+		if typeof(value) == "Content" then
+			return value
+		end
+		if type(value) == "string" and value ~= "" then
+			local ok, content = pcall(Content.fromUri, value)
+			if ok then
+				return content
+			end
+		end
+		return nil
+	end
+
+	local function prepareTriangleMeshPart(instance)
+		local override = getOrCreateInstanceOverride(instance)
+		local properties = override.Properties
+
+		if FixTriangleMeshCollisions then
+			properties.CollisionFidelity = Enum.CollisionFidelity.Default
+		end
+
+		if PreferModernMeshContent and instance:IsA("MeshPart") then
+			local meshContent = normalizeContent(tryReadPropertyCompat(instance, "MeshContent"))
+			local textureContent = normalizeContent(tryReadPropertyCompat(instance, "TextureContent"))
+
+			if meshContent then
+				properties.MeshContent = meshContent
+			end
+			if textureContent then
+				properties.TextureContent = textureContent
+			end
+
+			-- Legacy fallbacks are still useful for clients/API dumps that serialize
+			-- the old ContentId properties instead of the newer Content properties.
+			local meshId = tryReadPropertyCompat(instance, "MeshId")
+			local textureId = tryReadPropertyCompat(instance, "TextureID")
+
+			if type(meshId) == "string" and meshId ~= "" then
+				properties.MeshId = meshId
+				properties.MeshID = meshId
+			end
+			if type(textureId) == "string" and textureId ~= "" then
+				properties.TextureID = textureId
+			end
+		end
+
+		return override
+	end
+
+	local function preparePartOperation(instance)
+		local override = prepareTriangleMeshPart(instance)
+		local properties = override.Properties
+
+		if not PreservePartOperationGeometry then
+			return true, override
+		end
+
+		local content
+		for _, propertyName in { "Content", "AssetId", "AssetID" } do
+			content = normalizeContent(tryReadPropertyCompat(instance, propertyName))
+			if content then
+				break
+			end
+		end
+
+		if content then
+			properties.Content = content
+			return true, override
+		end
+
+		return false, override
 	end
 
 	local function gsubCaseInsensitive(input, search, replacement)
@@ -4518,10 +5095,35 @@ end
 							continue -- They won't show up in Studio anyway (Enable SaveNotCreatable if you wish to bypass this)
 						end
 					else -- ! Assuming nothing that is a PartOperation or inherits from it is in NotCreatableFixes
-						if TreatUnionsAsParts and instance:IsA("PartOperation") then
-							ClassName, InstanceOverride = "Part", replaceClassName(instance, InstanceName, ClassName)
-							ClassNameOverride = "BasePart" -- * Mutual Superclass for PartOperation and Part; For properties only
-						elseif not ClassList[ClassName] then -- ? API Dump is outdated then
+						if instance:IsA("PartOperation") then
+							local geometryReadable = false
+
+							if not TreatUnionsAsParts then
+								geometryReadable, InstanceOverride = preparePartOperation(instance)
+							end
+
+							if TreatUnionsAsParts or (not geometryReadable and UnionFallbackToPart) then
+								local originalClassName = ClassName
+								ClassName = "Part"
+
+								local convertedOverride = replaceClassName(instance, InstanceName, originalClassName)
+								if convertedOverride then
+									InstanceOverride = convertedOverride
+								else
+									InstanceOverride = getOrCreateInstanceOverride(instance)
+								end
+
+								ClassNameOverride = "BasePart"
+
+								if not geometryReadable and not TreatUnionsAsParts then
+									warn("[Geometry] Could not recover PartOperation geometry; saved placeholder Part:", instance:GetFullName())
+								end
+							end
+						elseif instance:IsA("TriangleMeshPart") then
+							InstanceOverride = prepareTriangleMeshPart(instance)
+						end
+
+						if not ClassList[ClassName] then -- ? API Dump is outdated then
 							if __DEBUG_MODE then
 								__DEBUG_MODE("Class not Found", ClassName)
 							end
@@ -5494,6 +6096,44 @@ end
 					warn(result)
 					Cleanup()
 					return
+				end
+			end
+
+			if OPTIONS.PropertyPatchesDumper and PropertyPatchReport then
+				local fileName
+				if type(OPTIONS.PropertyPatchesDumper) == "string" then
+					fileName = OPTIONS.PropertyPatchesDumper
+				else
+					fileName =
+						"PropertyPatches_"
+						.. string.gsub(tostring(FULL_VERSION), "[^%w%._%-]", "_")
+						.. ".json"
+				end
+
+				if not string.match(string.lower(fileName), "%.json$") then
+					fileName ..= ".json"
+				end
+
+				local encodedOk, encoded = pcall(
+					service.HttpService.JSONEncode,
+					service.HttpService,
+					PropertyPatchReport
+				)
+
+				if encodedOk then
+					local writeOk, writeErr = pcall(writefile, fileName, encoded)
+					if writeOk then
+						print(
+							"[PropertyPatchesDumper] Wrote "
+								.. tostring(PropertyPatchReport.Count)
+								.. " suspicious properties to "
+								.. fileName
+						)
+					else
+						warn("[PropertyPatchesDumper] Failed to write report:", writeErr)
+					end
+				else
+					warn("[PropertyPatchesDumper] Failed to JSON encode report:", encoded)
 				end
 			end
 		end
