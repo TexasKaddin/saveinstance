@@ -3470,6 +3470,7 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field UnionVoxelEpsilon number -- Inside-test tolerance in studs. ___Default:___ 0.001
 --- @field UnionVoxelMaxSamples number -- Per-union safety limit. Resolution is automatically increased for large unions to stay below this sample count. ___Default:___ 50000
 --- @field UnionVoxelMaxParts number -- Per-union merged-part safety limit. If exceeded, the exporter falls back to the normal placeholder Part. ___Default:___ 5000
+--- @field MarkVoxelUnionsForStudioRestore boolean -- Adds a marker to voxel-reconstructed PartOperations so USSI_RestoreVoxelUnions_Studio.lua can turn them into real UnionOperation instances in Studio. ___Default:___ true
 
 --- @interface OptionsAliases
 --- @within SynSaveInstance
@@ -3662,6 +3663,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		UnionVoxelEpsilon = 0.001,
 		UnionVoxelMaxSamples = 50000,
 		UnionVoxelMaxParts = 5000,
+		MarkVoxelUnionsForStudioRestore = true,
 		AlternativeWritefile = not arrayToDict({ "WRD", "Xeno", "Zorara" })[EXECUTOR_NAME],
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
@@ -3970,6 +3972,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local UnionVoxelEpsilon = math.max(0, tonumber(OPTIONS.UnionVoxelEpsilon) or 0.001)
 	local UnionVoxelMaxSamples = math.max(64, math.floor(tonumber(OPTIONS.UnionVoxelMaxSamples) or 50000))
 	local UnionVoxelMaxParts = math.max(1, math.floor(tonumber(OPTIONS.UnionVoxelMaxParts) or 5000))
+	local MarkVoxelUnionsForStudioRestore = OPTIONS.MarkVoxelUnionsForStudioRestore ~= false
 	local GeneratedGeometryInstances = {}
 	local VoxelizedUnionCount = 0
 
@@ -5346,6 +5349,16 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		for _, child in instance:GetChildren() do
 			children[#children + 1] = child
 		end
+
+		if MarkVoxelUnionsForStudioRestore then
+			local marker = Instance.new("StringValue")
+			marker.Name = "__USSI_VoxelUnionMarker"
+			marker.Value = instance.ClassName
+
+			GeneratedGeometryInstances[#GeneratedGeometryInstances + 1] = marker
+			children[#children + 1] = marker
+		end
+
 		for _, child in result.parts do
 			children[#children + 1] = child
 		end
