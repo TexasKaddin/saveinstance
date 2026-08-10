@@ -3454,6 +3454,11 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field PropertyPatchHeuristics boolean -- Uses conservative Full-Dump name heuristics for backing descriptors such as *_XML, *Internal, *Serialize, *Serialized, *_SerializedRollout and lower-case XML aliases. ___Default:___ true
 --- @field PropertyPatchesDumper boolean|string -- Writes a JSON report of Full API Dump properties containing XML, Internal or Serialize. Set true for an automatic filename, or provide a .json filename. ___Default:___ false
 --- @field GeometryUseHiddenProperty boolean -- Allows the geometry recovery path to try the executor hidden-property getter even when IgnoreSpecialProperties disables it for normal serialization. All geometry reads are guarded with pcall. ___Default:___ true
+--- @field UnionVoxelFallback boolean -- When PartOperation CSG payloads are inaccessible, samples the real solid with GetClosestPointOnSurface and saves a merged-part reconstruction instead of a rectangular placeholder. ___Default:___ true
+--- @field UnionVoxelResolution number -- Preferred sampling resolution in studs for inaccessible PartOperations. Smaller values preserve more detail but take longer. ___Default:___ 0.25
+--- @field UnionVoxelEpsilon number -- Inside-test tolerance in studs. ___Default:___ 0.001
+--- @field UnionVoxelMaxSamples number -- Per-union safety limit. Resolution is automatically increased for large unions to stay below this sample count. ___Default:___ 50000
+--- @field UnionVoxelMaxParts number -- Per-union merged-part safety limit. If exceeded, the exporter falls back to the normal placeholder Part. ___Default:___ 5000
 
 --- @interface OptionsAliases
 --- @within SynSaveInstance
@@ -3630,6 +3635,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		PropertyPatchHeuristics = true,
 		PropertyPatchesDumper = false,
 		GeometryUseHiddenProperty = true,
+		UnionVoxelFallback = true,
+		UnionVoxelResolution = 0.25,
+		UnionVoxelEpsilon = 0.001,
+		UnionVoxelMaxSamples = 50000,
+		UnionVoxelMaxParts = 5000,
 		AlternativeWritefile = not arrayToDict({ "WRD", "Xeno", "Zorara" })[EXECUTOR_NAME],
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
@@ -3933,6 +3943,13 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local PreferModernMeshContent = OPTIONS.PreferModernMeshContent ~= false
 	local FixTriangleMeshCollisions = OPTIONS.FixTriangleMeshCollisions ~= false
 	local GeometryUseHiddenProperty = OPTIONS.GeometryUseHiddenProperty ~= false
+	local UnionVoxelFallback = OPTIONS.UnionVoxelFallback ~= false
+	local UnionVoxelResolution = math.max(0.05, tonumber(OPTIONS.UnionVoxelResolution) or 0.25)
+	local UnionVoxelEpsilon = math.max(0, tonumber(OPTIONS.UnionVoxelEpsilon) or 0.001)
+	local UnionVoxelMaxSamples = math.max(64, math.floor(tonumber(OPTIONS.UnionVoxelMaxSamples) or 50000))
+	local UnionVoxelMaxParts = math.max(1, math.floor(tonumber(OPTIONS.UnionVoxelMaxParts) or 5000))
+	local GeneratedGeometryInstances = {}
+	local VoxelizedUnionCount = 0
 
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
@@ -4438,18 +4455,35 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			return false
 		end
 
-		if type(value) == "string" then
+		local valueType = typeof(value)
+
+		-- Xeno v1.3.x returns numeric 0 for inaccessible hidden properties,
+		-- including invalid property names. Never treat that sentinel as geometry.
+		if valueType == "number" then
+			return false
+		end
+
+		if valueType == "string" then
 			return value ~= ""
 		end
 
-		if typeof(value) == "Content" then
+		if valueType == "buffer" then
+			local ok, length = pcall(buffer.len, value)
+			return ok and length > 0
+		end
+
+		if valueType == "Content" then
 			local ok, sourceType = pcall(index, value, "SourceType")
 			if ok and sourceType == Enum.ContentSourceType.None then
 				return false
 			end
 		end
 
-		return true
+		-- CSG payloads can also be represented as SharedString/content objects.
+		return valueType == "Content"
+			or valueType == "SharedString"
+			or valueType == "string"
+			or valueType == "buffer"
 	end
 
 	local function copyGeometryProperty(instance, properties, propertyName)
@@ -4614,6 +4648,256 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 
 		return false, override
+	end
+
+
+	local function calculateVoxelGrid(size)
+		local resolution = UnionVoxelResolution
+
+		local function dimensions(res)
+			return
+				math.max(1, math.ceil(size.X / res)),
+				math.max(1, math.ceil(size.Y / res)),
+				math.max(1, math.ceil(size.Z / res))
+		end
+
+		local nx, ny, nz = dimensions(resolution)
+		local samples = nx * ny * nz
+
+		-- Large CSGs can explode in sample count. Increase the effective
+		-- resolution until the union fits under the configured safety limit.
+		if samples > UnionVoxelMaxSamples then
+			local multiplier = (samples / UnionVoxelMaxSamples) ^ (1 / 3)
+			resolution *= multiplier
+			nx, ny, nz = dimensions(resolution)
+
+			while nx * ny * nz > UnionVoxelMaxSamples do
+				resolution *= 1.05
+				nx, ny, nz = dimensions(resolution)
+			end
+		end
+
+		return resolution, nx, ny, nz
+	end
+
+	local function voxelizePartOperation(instance)
+		local size = instance.Size
+		local _, nx, ny, nz = calculateVoxelGrid(size)
+
+		local cellSize = Vector3.new(
+			size.X / nx,
+			size.Y / ny,
+			size.Z / nz
+		)
+
+		local yz = ny * nz
+		local function linearIndex(x, y, z)
+			return ((x - 1) * yz) + ((y - 1) * nz) + z
+		end
+
+		local occupied = table.create(nx * ny * nz, false)
+		local occupiedCount = 0
+
+		for y = 1, ny do
+			for z = 1, nz do
+				for x = 1, nx do
+					local localPosition = Vector3.new(
+						-size.X / 2 + (x - 0.5) * cellSize.X,
+						-size.Y / 2 + (y - 0.5) * cellSize.Y,
+						-size.Z / 2 + (z - 0.5) * cellSize.Z
+					)
+
+					local worldPosition = instance.CFrame:PointToWorldSpace(localPosition)
+					local ok, closest = pcall(instance.GetClosestPointOnSurface, instance, worldPosition)
+
+					if ok and (closest - worldPosition).Magnitude <= UnionVoxelEpsilon then
+						occupied[linearIndex(x, y, z)] = true
+						occupiedCount += 1
+					end
+				end
+			end
+
+			if y % 4 == 0 then
+				wait_for_render()
+			end
+		end
+
+		if occupiedCount == 0 then
+			return nil, "no occupied samples"
+		end
+
+		local visited = table.create(nx * ny * nz, false)
+		local boxes = {}
+
+		-- Greedy 3-D cuboid packing. This is substantially smaller than saving
+		-- one Part per occupied sample and preserves the voxel silhouette.
+		for y = 1, ny do
+			for z = 1, nz do
+				for x = 1, nx do
+					local firstIndex = linearIndex(x, y, z)
+					if occupied[firstIndex] and not visited[firstIndex] then
+						local x2 = x
+						while x2 + 1 <= nx do
+							local idx = linearIndex(x2 + 1, y, z)
+							if not occupied[idx] or visited[idx] then
+								break
+							end
+							x2 += 1
+						end
+
+						local z2 = z
+						while z2 + 1 <= nz do
+							local canExpand = true
+							for tx = x, x2 do
+								local idx = linearIndex(tx, y, z2 + 1)
+								if not occupied[idx] or visited[idx] then
+									canExpand = false
+									break
+								end
+							end
+							if not canExpand then
+								break
+							end
+							z2 += 1
+						end
+
+						local y2 = y
+						while y2 + 1 <= ny do
+							local canExpand = true
+							for tz = z, z2 do
+								for tx = x, x2 do
+									local idx = linearIndex(tx, y2 + 1, tz)
+									if not occupied[idx] or visited[idx] then
+										canExpand = false
+										break
+									end
+								end
+								if not canExpand then
+									break
+								end
+							end
+							if not canExpand then
+								break
+							end
+							y2 += 1
+						end
+
+						for ty = y, y2 do
+							for tz = z, z2 do
+								for tx = x, x2 do
+									visited[linearIndex(tx, ty, tz)] = true
+								end
+							end
+						end
+
+						boxes[#boxes + 1] = { x, y, z, x2, y2, z2 }
+						if #boxes > UnionVoxelMaxParts then
+							return nil, "merged part count exceeded " .. tostring(UnionVoxelMaxParts)
+						end
+					end
+				end
+			end
+		end
+
+		local generated = table.create(#boxes)
+
+		for i, box in ipairs(boxes) do
+			local x1, y1, z1, x2, y2, z2 =
+				box[1], box[2], box[3], box[4], box[5], box[6]
+
+			local center = Vector3.new(
+				-size.X / 2 + (((x1 + x2) / 2) - 0.5) * cellSize.X,
+				-size.Y / 2 + (((y1 + y2) / 2) - 0.5) * cellSize.Y,
+				-size.Z / 2 + (((z1 + z2) / 2) - 0.5) * cellSize.Z
+			)
+
+			local part = Instance.new("Part")
+			part.Name = "__USSI_Voxel"
+			part.Size = Vector3.new(
+				(x2 - x1 + 1) * cellSize.X,
+				(y2 - y1 + 1) * cellSize.Y,
+				(z2 - z1 + 1) * cellSize.Z
+			)
+			part.CFrame = instance.CFrame * CFrame.new(center)
+
+			part.Anchored = instance.Anchored
+			part.CanCollide = instance.CanCollide
+			part.CanTouch = instance.CanTouch
+			part.CanQuery = instance.CanQuery
+			part.CastShadow = instance.CastShadow
+			part.Color = instance.Color
+			part.Material = instance.Material
+			part.Reflectance = instance.Reflectance
+			part.Transparency = instance.Transparency
+			part.Massless = instance.Massless
+
+			pcall(function()
+				part.CollisionGroup = instance.CollisionGroup
+			end)
+
+			pcall(function()
+				part.CustomPhysicalProperties = instance.CustomPhysicalProperties
+			end)
+
+			GeneratedGeometryInstances[#GeneratedGeometryInstances + 1] = part
+			generated[i] = part
+		end
+
+		return {
+			parts = generated,
+			occupiedCount = occupiedCount,
+			sampleCount = nx * ny * nz,
+			cellSize = cellSize,
+			grid = Vector3.new(nx, ny, nz),
+		}
+	end
+
+	local function prepareVoxelPartOperation(instance, existingOverride)
+		local result, reason = voxelizePartOperation(instance)
+		if not result then
+			return false, existingOverride, reason
+		end
+
+		local override = existingOverride or getOrCreateInstanceOverride(instance)
+		local properties = override.Properties
+
+		-- The converted parent Part is only a transparent hierarchy container.
+		-- The generated children carry the reconstructed geometry.
+		properties.Transparency = 1
+		properties.Reflectance = 0
+		properties.CanCollide = false
+		properties.CanTouch = false
+		properties.CanQuery = false
+		properties.CastShadow = false
+		properties.Massless = true
+		properties.Size = Vector3.new(0.05, 0.05, 0.05)
+
+		local children = {}
+		for _, child in instance:GetChildren() do
+			children[#children + 1] = child
+		end
+		for _, child in result.parts do
+			children[#children + 1] = child
+		end
+		override.__Children = children
+
+		VoxelizedUnionCount += 1
+		if VoxelizedUnionCount <= 10 or VoxelizedUnionCount % 25 == 0 then
+			print(
+				"[Geometry] Voxelized PartOperation:",
+				instance:GetFullName(),
+				"| samples:",
+				result.sampleCount,
+				"| occupied:",
+				result.occupiedCount,
+				"| merged parts:",
+				#result.parts,
+				"| cell:",
+				result.cellSize
+			)
+		end
+
+		return true, override, result
 	end
 
 	local function gsubCaseInsensitive(input, search, replacement)
@@ -5251,26 +5535,49 @@ end
 					else -- ! Assuming nothing that is a PartOperation or inherits from it is in NotCreatableFixes
 						if instance:IsA("PartOperation") then
 							local geometryReadable = false
+							local voxelized = false
+							local voxelReason
 
 							if not TreatUnionsAsParts then
 								geometryReadable, InstanceOverride = preparePartOperation(instance)
 							end
 
-							if TreatUnionsAsParts or (not geometryReadable and UnionFallbackToPart) then
+							if not geometryReadable and not TreatUnionsAsParts and UnionVoxelFallback then
+								voxelized, InstanceOverride, voxelReason =
+									prepareVoxelPartOperation(instance, InstanceOverride)
+							end
+
+							if TreatUnionsAsParts or voxelized or (not geometryReadable and UnionFallbackToPart) then
 								local originalClassName = ClassName
 								ClassName = "Part"
 
 								local convertedOverride = replaceClassName(instance, InstanceName, originalClassName)
 								if convertedOverride then
+									if InstanceOverride and InstanceOverride ~= convertedOverride then
+										for key, value in InstanceOverride do
+											if key == "Properties" then
+												convertedOverride.Properties = convertedOverride.Properties or {}
+												for propertyName, propertyValue in value do
+													convertedOverride.Properties[propertyName] = propertyValue
+												end
+											else
+												convertedOverride[key] = value
+											end
+										end
+									end
 									InstanceOverride = convertedOverride
 								else
-									InstanceOverride = getOrCreateInstanceOverride(instance)
+									InstanceOverride = InstanceOverride or getOrCreateInstanceOverride(instance)
 								end
 
 								ClassNameOverride = "BasePart"
 
-								if not geometryReadable and not TreatUnionsAsParts then
-									warn("[Geometry] Could not recover PartOperation geometry; saved placeholder Part:", instance:GetFullName())
+								if not geometryReadable and not voxelized and not TreatUnionsAsParts then
+									warn(
+										"[Geometry] Could not recover PartOperation geometry; saved placeholder Part:",
+										instance:GetFullName(),
+										voxelReason and ("| voxel fallback: " .. tostring(voxelReason)) or ""
+									)
 								end
 							end
 						elseif instance:IsA("TriangleMeshPart") then
@@ -5909,6 +6216,14 @@ end
 		for _, connection in Connections do
 			connection:Disconnect()
 		end
+
+		for _, instance in GeneratedGeometryInstances do
+			pcall(function()
+				instance:Destroy()
+			end)
+		end
+		table.clear(GeneratedGeometryInstances)
+
 		GLOBAL_ENV[placename] = nil
 	end
 	do
@@ -6314,6 +6629,9 @@ end
 			gethiddenproperty = old_gethiddenproperty
 		end
 
+		if VoxelizedUnionCount > 0 then
+			print("[Geometry] Voxel fallback complete:", VoxelizedUnionCount, "PartOperations reconstructed.")
+		end
 		Cleanup()
 
 		elapse_t = os.clock() - elapse_t
