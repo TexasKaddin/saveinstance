@@ -4682,6 +4682,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 								.. "\n"
 						end
 					end
+				end
 
 				if ScriptCache and bytecode then
 					ldeccache[bytecode] = output
