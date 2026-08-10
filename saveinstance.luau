@@ -4615,88 +4615,109 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return failureText
 	end
 
-	do
-		if not OPTIONS.Decompile then
-			ldecompile = function()
-				return "-- Decompiling is disabled"
+	-- Keep the decompiler selection flat. This avoids parser ambiguity on
+	-- some executor Luau builds around `else` following an assigned function.
+	if not OPTIONS.Decompile then
+		ldecompile = function()
+			return "-- Decompiling is disabled"
+		end
+	end
+
+	if
+		OPTIONS.Decompile
+		and (getscriptbytecode or type(ExecutorDecompile) == "function")
+	then
+		local decomp = makeTimeoutHandler(
+			OPTIONS.DecompileTimeout,
+			decompileScript,
+			"Decompiler timed out"
+		)
+
+		local function runDecompilerForScript(script)
+			local bytecode
+
+			if ScriptCache and getbytecode then
+				local success
+				success, bytecode = getbytecode(script)
+
+				if success then
+					if not bytecode or bytecode == "" then
+						return "-- The Script is Empty"
+					end
+
+					local cached = ldeccache[bytecode]
+					if cached then
+						if __DEBUG_MODE then
+							__DEBUG_MODE("Found in Cache", script:GetFullName())
+						end
+						return cached
+					end
+				else
+					bytecode = nil
+				end
+			elseif DecompileJobless then
+				return "-- Not found in already decompiled ScriptCache"
 			end
-		elseif getscriptbytecode or type(ExecutorDecompile) == "function" then
-			local decomp = makeTimeoutHandler(
-				OPTIONS.DecompileTimeout,
-				decompileScript,
-				"Decompiler timed out"
+
+			local ok, result = run_with_loading(
+				"Decompiling " .. script.Name,
+				true,
+				nil,
+				decomp,
+				script,
+				bytecode
 			)
 
-			ldecompile = function(script)
-				local bytecode
-
-				if ScriptCache and getbytecode then
-					local success
-					success, bytecode = getbytecode(script)
-
-					if success then
-						if not bytecode or bytecode == "" then
-							return "-- The Script is Empty"
-						end
-
-						local cached = ldeccache[bytecode]
-						if cached then
-							if __DEBUG_MODE then
-								__DEBUG_MODE("Found in Cache", script:GetFullName())
-							end
-							return cached
-						end
-					else
-						bytecode = nil
-					end
-				elseif DecompileJobless then
-					return "-- Not found in already decompiled ScriptCache"
-				end
-
-				local ok, result = run_with_loading(
-					"Decompiling " .. script.Name,
-					true,
-					nil,
-					decomp,
-					script,
-					bytecode
-				)
-
-				if not result then
-					ok, result = false, "Empty Output"
-				end
-
-				local output
-				if ok then
-					result = string.gsub(tostring(result), "\0", "\\0")
-					output = result
-				else
-					output = "--[[ Failed to decompile. Reason:\n" .. tostring(result or "") .. "\n]]"
-
-					if SaveBytecodeOnDecompileFailure and bytecode then
-						local encodedOk, encoded = pcall(base64encode, bytecode)
-						if encodedOk and type(encoded) == "string" and encoded ~= "" then
-							output ..=
-								"\n\n-- Bytecode fallback (Base64):\n-- "
-								.. encoded
-								.. "\n"
-						end
-					end
-				end
-
-				if ScriptCache and bytecode then
-					ldeccache[bytecode] = output
-					if __DEBUG_MODE then
-						__DEBUG_MODE("Cached", script:GetFullName())
-					end
-				end
-
-				return output
+			if not result then
+				ok = false
+				result = "Empty Output"
 			end
-		else
-			ldecompile = function()
-				return "-- Your Executor does NOT expose a decompiler or getscriptbytecode"
+
+			local output
+
+			if ok then
+				result = string.gsub(tostring(result), "\0", "\\0")
+				output = result
+			else
+				output =
+					"--[[ Failed to decompile. Reason:\n"
+					.. tostring(result or "")
+					.. "\n]]"
+
+				if SaveBytecodeOnDecompileFailure and bytecode then
+					local encodedOk, encoded = pcall(base64encode, bytecode)
+
+					if
+						encodedOk
+						and type(encoded) == "string"
+						and encoded ~= ""
+					then
+						output =
+							output
+							.. "\n\n-- Bytecode fallback (Base64):\n-- "
+							.. encoded
+							.. "\n"
+					end
+				end
 			end
+
+			if ScriptCache and bytecode then
+				ldeccache[bytecode] = output
+
+				if __DEBUG_MODE then
+					__DEBUG_MODE("Cached", script:GetFullName())
+				end
+			end
+
+			return output
+		end
+
+		ldecompile = runDecompilerForScript
+	end
+
+	if not ldecompile then
+		ldecompile = function()
+			return "-- Your Executor does NOT expose a decompiler or getscriptbytecode"
 		end
 	end
 
