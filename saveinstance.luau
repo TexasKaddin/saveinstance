@@ -1257,10 +1257,28 @@ do
 				"RenderFidelity",
 				"SmoothingAngle",
 				"UsePartColor",
+
+				-- CSG geometry/backing data.
+				"AssetId",
+				"ChildData",
+				"ChildData2",
+				"Content",
+				"ComponentIndex",
+				"FormFactor",
+				"InitialSize",
+				"ManifoldMesh_DEPRECATED",
+				"MeshData",
+				"MeshData2",
+				"OffCentered",
+				"PhysicsData",
+				"SolidMeshHolder",
 			},
 			TriangleMeshPart = {
 				"CollisionFidelity",
 				"FluidFidelity",
+				"AeroMeshData",
+				"ConvexDecompHolder",
+				"PhysicalConfigData",
 			},
 		},
 		Blacklist = {
@@ -3435,6 +3453,7 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field FixTriangleMeshCollisions boolean -- Writes CollisionFidelity=Default for MeshParts/PartOperations to avoid broken collision data in the copied place. ___Default:___ true
 --- @field PropertyPatchHeuristics boolean -- Uses conservative Full-Dump name heuristics for backing descriptors such as *_XML, *Internal, *Serialize, *Serialized, *_SerializedRollout and lower-case XML aliases. ___Default:___ true
 --- @field PropertyPatchesDumper boolean|string -- Writes a JSON report of Full API Dump properties containing XML, Internal or Serialize. Set true for an automatic filename, or provide a .json filename. ___Default:___ false
+--- @field GeometryUseHiddenProperty boolean -- Allows the geometry recovery path to try the executor hidden-property getter even when IgnoreSpecialProperties disables it for normal serialization. All geometry reads are guarded with pcall. ___Default:___ true
 
 --- @interface OptionsAliases
 --- @within SynSaveInstance
@@ -3610,6 +3629,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		FixTriangleMeshCollisions = true,
 		PropertyPatchHeuristics = true,
 		PropertyPatchesDumper = false,
+		GeometryUseHiddenProperty = true,
 		AlternativeWritefile = not arrayToDict({ "WRD", "Xeno", "Zorara" })[EXECUTOR_NAME],
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
@@ -3901,7 +3921,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local IgnorePropertiesOfNotScriptsOnScriptsMode = OPTIONS.IgnorePropertiesOfNotScriptsOnScriptsMode
 
 	local old_gethiddenproperty
-	if OPTIONS and gethiddenproperty then
+	if OPTIONS.IgnoreSpecialProperties and gethiddenproperty then
 		old_gethiddenproperty = gethiddenproperty
 		gethiddenproperty = nil
 	end
@@ -3912,6 +3932,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local UnionFallbackToPart = OPTIONS.UnionFallbackToPart ~= false
 	local PreferModernMeshContent = OPTIONS.PreferModernMeshContent ~= false
 	local FixTriangleMeshCollisions = OPTIONS.FixTriangleMeshCollisions ~= false
+	local GeometryUseHiddenProperty = OPTIONS.GeometryUseHiddenProperty ~= false
 
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
@@ -4369,24 +4390,34 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local function tryReadPropertyCompat(instance, propertyName)
 		local ok, value = pcall(index, instance, propertyName)
 		if ok and value ~= nil then
-			return value
+			return value, "normal"
 		end
 
 		if gethiddenproperty then
 			ok, value = pcall(gethiddenproperty, instance, propertyName)
 			if ok and value ~= nil then
-				return value
+				return value, "gethiddenproperty"
+			end
+		end
+
+		-- IgnoreSpecialProperties can intentionally disable the global getter.
+		-- Geometry recovery may still opt into the original getter because CSG
+		-- payloads cannot otherwise be reconstructed.
+		if GeometryUseHiddenProperty and old_gethiddenproperty then
+			ok, value = pcall(old_gethiddenproperty, instance, propertyName)
+			if ok and value ~= nil then
+				return value, "old_gethiddenproperty"
 			end
 		end
 
 		if gethiddenproperty_fallback then
 			ok, value = pcall(gethiddenproperty_fallback, instance, propertyName)
 			if ok and value ~= nil then
-				return value
+				return value, "UGCValidationService"
 			end
 		end
 
-		return nil
+		return nil, nil
 	end
 
 	local function normalizeContent(value)
@@ -4402,6 +4433,34 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return nil
 	end
 
+	local function isNonEmptyGeometryValue(value)
+		if value == nil then
+			return false
+		end
+
+		if type(value) == "string" then
+			return value ~= ""
+		end
+
+		if typeof(value) == "Content" then
+			local ok, sourceType = pcall(index, value, "SourceType")
+			if ok and sourceType == Enum.ContentSourceType.None then
+				return false
+			end
+		end
+
+		return true
+	end
+
+	local function copyGeometryProperty(instance, properties, propertyName)
+		local value, method = tryReadPropertyCompat(instance, propertyName)
+		if isNonEmptyGeometryValue(value) then
+			properties[propertyName] = value
+			return true, value, method
+		end
+		return false, value, method
+	end
+
 	local function prepareTriangleMeshPart(instance)
 		local override = getOrCreateInstanceOverride(instance)
 		local properties = override.Properties
@@ -4410,7 +4469,18 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			properties.CollisionFidelity = Enum.CollisionFidelity.Default
 		end
 
-		if PreferModernMeshContent and instance:IsA("MeshPart") then
+		-- Preserve the common TriangleMeshPart backing payloads when the client
+		-- exposes them. These are useful for collision/physical reconstruction.
+		for _, propertyName in {
+			"AeroMeshData",
+			"ConvexDecompHolder",
+			"PhysicalConfigData",
+		} do
+			copyGeometryProperty(instance, properties, propertyName)
+		end
+
+		if instance:IsA("MeshPart") then
+			-- Prefer modern Content values.
 			local meshContent = normalizeContent(tryReadPropertyCompat(instance, "MeshContent"))
 			local textureContent = normalizeContent(tryReadPropertyCompat(instance, "TextureContent"))
 
@@ -4421,17 +4491,42 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				properties.TextureContent = textureContent
 			end
 
-			-- Legacy fallbacks are still useful for clients/API dumps that serialize
-			-- the old ContentId properties instead of the newer Content properties.
-			local meshId = tryReadPropertyCompat(instance, "MeshId")
+			-- Legacy/hidden mesh ID fallbacks. New clients can make MeshId
+			-- inaccessible while the deprecated MeshID backing descriptor is still
+			-- available through a hidden-property getter.
+			local meshId
+			for _, propertyName in { "MeshId", "MeshID" } do
+				local value = tryReadPropertyCompat(instance, propertyName)
+				if type(value) == "string" and value ~= "" then
+					meshId = value
+					break
+				end
+			end
+
 			local textureId = tryReadPropertyCompat(instance, "TextureID")
 
-			if type(meshId) == "string" and meshId ~= "" then
+			if meshId then
 				properties.MeshId = meshId
 				properties.MeshID = meshId
+				if not properties.MeshContent then
+					properties.MeshContent = normalizeContent(meshId)
+				end
 			end
+
 			if type(textureId) == "string" and textureId ~= "" then
 				properties.TextureID = textureId
+				if not properties.TextureContent then
+					properties.TextureContent = normalizeContent(textureId)
+				end
+			end
+
+			-- Current MeshPart internal payloads.
+			for _, propertyName in {
+				"InitialSize",
+				"PhysicsData",
+				"SolidMeshHolder",
+			} do
+				copyGeometryProperty(instance, properties, propertyName)
 			end
 		end
 
@@ -4446,16 +4541,75 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			return true, override
 		end
 
-		local content
-		for _, propertyName in { "Content", "AssetId", "AssetID" } do
-			content = normalizeContent(tryReadPropertyCompat(instance, propertyName))
-			if content then
-				break
+		local recovered = {}
+		local recoveredSize = 0
+		local function mark(propertyName, method)
+			recoveredSize += 1
+			recovered[recoveredSize] = propertyName .. (method and (" via " .. method) or "")
+		end
+
+		-- Newest asset/content-based representation.
+		local content, contentMethod = tryReadPropertyCompat(instance, "Content")
+		content = normalizeContent(content)
+		if content then
+			properties.Content = content
+			mark("Content", contentMethod)
+		end
+
+		local assetId, assetMethod = tryReadPropertyCompat(instance, "AssetId")
+		if type(assetId) == "string" and assetId ~= "" then
+			properties.AssetId = assetId
+
+			if not properties.Content then
+				local converted = normalizeContent(assetId)
+				if converted then
+					properties.Content = converted
+				end
+			end
+
+			mark("AssetId", assetMethod)
+		end
+
+		-- Embedded CSG payloads. Roblox has historically migrated these from
+		-- BinaryString -> SharedString -> asset-based storage, so we preserve
+		-- every non-empty representation the current client exposes.
+		for _, propertyName in {
+			"ChildData2",
+			"MeshData2",
+			"ChildData",
+			"MeshData",
+			"PhysicsData",
+			"PhysicalConfigData",
+			"SolidMeshHolder",
+			"ManifoldMesh_DEPRECATED",
+		} do
+			local ok, _, method = copyGeometryProperty(instance, properties, propertyName)
+			if ok then
+				mark(propertyName, method)
 			end
 		end
 
-		if content then
-			properties.Content = content
+		-- Supplemental CSG metadata. These do not count as recovered geometry by
+		-- themselves, but preserving them improves fidelity when the payload above
+		-- is available.
+		for _, propertyName in {
+			"ComponentIndex",
+			"DCDPropertyData",
+			"FormFactor",
+			"InitialSize",
+			"OffCentered",
+		} do
+			copyGeometryProperty(instance, properties, propertyName)
+		end
+
+		if recoveredSize > 0 then
+			if __DEBUG_MODE then
+				__DEBUG_MODE(
+					"Recovered PartOperation geometry",
+					instance:GetFullName(),
+					table.concat(recovered, ", ")
+				)
+			end
 			return true, override
 		end
 
