@@ -3418,6 +3418,13 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field scriptcache boolean -- Use decompiled script cache to avoid decompiling duplicate scripts. ___Default:___ true
 --- @field DecompileTimeout number -- If the decompilation run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 10
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
+--- @field RemoteDecompiler boolean -- Falls back to a bytecode decompiler API when the executor decompiler is missing or returns an error page/message. ___Default:___ true
+--- @field RemoteDecompilerUrl string -- Bytecode decompiler API endpoint. ___Default:___ "https://api.lua.expert/decompile"
+--- @field RemoteDecompilerRequestsPerMinute number -- Client-side request pacing limit. Kept below the provider limit. ___Default:___ 450
+--- @field RemoteDecompilerRequestTimeout number -- Timeout for a single remote decompiler HTTP attempt. ___Default:___ 12
+--- @field RemoteDecompilerRetries number -- Number of attempts for transient HTTP/API failures. ___Default:___ 3
+--- @field PreferRemoteDecompiler boolean -- Uses the remote bytecode decompiler before the executor decompiler. Defaults true automatically on Xeno. ___Default:___ false
+--- @field SaveBytecodeOnDecompileFailure boolean -- If all decompilers fail, embeds Base64 bytecode in the saved script so it can be recovered later. ___Default:___ true
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. ___Default:___ false
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
@@ -3535,8 +3542,15 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		Decompile = true,
 		scriptcache = true,
 		-- decomptype = "",
-		DecompileTimeout = 10,
+		DecompileTimeout = 30,
 		BytecodeTimeout = 3,
+		RemoteDecompiler = true,
+		RemoteDecompilerUrl = "https://api.lua.expert/decompile",
+		RemoteDecompilerRequestsPerMinute = 450,
+		RemoteDecompilerRequestTimeout = 12,
+		RemoteDecompilerRetries = 3,
+		PreferRemoteDecompiler = false,
+		SaveBytecodeOnDecompileFailure = true,
 		-- * New:
 		__DEBUG_MODE = false,
 
@@ -4298,60 +4312,379 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	end
 
+	-- Xeno's built-in decompile() can currently return a normal string containing
+	-- an API failure (for example "api request error" / "no response"). The old
+	-- USSI path considered any returned string successful, so those messages were
+	-- saved as Script.Source. This wrapper validates output and can decompile the
+	-- bytecode directly through the configured API instead.
+	local ExecutorDecompile = decompile
+	local HttpRequest =
+		request
+		or http_request
+		or (type(syn) == "table" and syn.request)
+		or (type(http) == "table" and http.request)
+
+	local RemoteDecompilerEnabled = OPTIONS.RemoteDecompiler ~= false
+	local RemoteDecompilerUrl = tostring(OPTIONS.RemoteDecompilerUrl or "https://api.lua.expert/decompile")
+	local RemoteDecompilerRPM = math.max(1, tonumber(OPTIONS.RemoteDecompilerRequestsPerMinute) or 450)
+	local RemoteDecompilerTimeout = math.max(1, tonumber(OPTIONS.RemoteDecompilerRequestTimeout) or 12)
+	local RemoteDecompilerRetries = math.max(1, math.floor(tonumber(OPTIONS.RemoteDecompilerRetries) or 3))
+	local PreferRemoteDecompiler =
+		OPTIONS.PreferRemoteDecompiler == true
+		or string.find(string.lower(EXECUTOR_NAME), "xeno", 1, true) ~= nil
+	local SaveBytecodeOnDecompileFailure = OPTIONS.SaveBytecodeOnDecompileFailure ~= false
+
+	local nextRemoteDecompilerRequest = 0
+
+	local function isBadDecompilerOutput(result)
+		if type(result) ~= "string" then
+			return true, "non-string decompiler output"
+		end
+
+		local trimmed = string.match(result, "^%s*(.-)%s*$") or ""
+		if trimmed == "" then
+			return true, "empty decompiler output"
+		end
+
+		local lowered = string.lower(trimmed)
+		local badMarkers = {
+			"api request error",
+			"no response",
+			"failed to decompile",
+			"decompiler timed out",
+			"internal server error",
+			"service unavailable",
+			"bad gateway",
+			"gateway timeout",
+			"too many requests",
+		}
+
+		for _, marker in badMarkers do
+			if string.find(lowered, marker, 1, true) then
+				return true, marker
+			end
+		end
+
+		return false
+	end
+
+	local function normalizeHttpResponse(response)
+		if type(response) ~= "table" then
+			return nil, nil, nil
+		end
+
+		local status =
+			response.StatusCode
+			or response.Status
+			or response.status_code
+			or response.status
+
+		local body =
+			response.Body
+			or response.body
+			or response.ResponseBody
+			or response.response
+
+		local success = response.Success
+		if success == nil then
+			success = response.success
+		end
+
+		return tonumber(status), body, success
+	end
+
+	local function waitForRemoteSlot()
+		local gap = 60 / RemoteDecompilerRPM
+		local now = os.clock()
+		local slot = math.max(now, nextRemoteDecompilerRequest)
+		nextRemoteDecompilerRequest = slot + gap
+
+		local delay = slot - now
+		if delay > 0 then
+			task.wait(delay)
+		end
+	end
+
+	local function callRequestWithTimeout(options)
+		if type(HttpRequest) ~= "function" then
+			return false, "executor does not expose request/http_request"
+		end
+
+		local settled = false
+		local packed
+
+		task.spawn(function()
+			packed = table.pack(pcall(HttpRequest, options))
+			settled = true
+		end)
+
+		local deadline = os.clock() + RemoteDecompilerTimeout
+		while not settled and os.clock() < deadline do
+			task.wait(0.03)
+		end
+
+		if not settled then
+			return false, "remote decompiler request timed out"
+		end
+
+		if not packed[1] then
+			return false, tostring(packed[2])
+		end
+
+		return true, packed[2]
+	end
+
+	local function decompileBytecodeViaRemote(bytecode)
+		if not RemoteDecompilerEnabled then
+			return false, "remote decompiler disabled"
+		end
+
+		if type(HttpRequest) ~= "function" then
+			return false, "executor does not expose request/http_request"
+		end
+
+		if type(bytecode) ~= "string" or bytecode == "" then
+			return false, "script bytecode is empty"
+		end
+
+		local encodedBytecode
+		local ok, result = pcall(base64encode, bytecode)
+		if ok and type(result) == "string" and result ~= "" then
+			encodedBytecode = result
+		else
+			return false, "failed to Base64 encode bytecode"
+		end
+
+		local body = service.HttpService:JSONEncode({
+			script = encodedBytecode,
+		})
+
+		local lastError = "unknown remote decompiler error"
+
+		for attempt = 1, RemoteDecompilerRetries do
+			waitForRemoteSlot()
+
+			local requestOk, response = callRequestWithTimeout({
+				Url = RemoteDecompilerUrl,
+				Method = "POST",
+				Headers = {
+					["content-type"] = "application/json",
+					["accept"] = "text/plain",
+				},
+				Body = body,
+			})
+
+			if requestOk then
+				local status, responseBody, success = normalizeHttpResponse(response)
+
+				if type(responseBody) == "string" then
+					local bad, reason = isBadDecompilerOutput(responseBody)
+
+					if
+						(status == nil or (status >= 200 and status < 300))
+						and success ~= false
+						and not bad
+					then
+						return true, responseBody
+					end
+
+					lastError =
+						"HTTP "
+						.. tostring(status or "?")
+						.. ": "
+						.. tostring(reason or string.sub(responseBody, 1, 300))
+				else
+					lastError =
+						"HTTP "
+						.. tostring(status or "?")
+						.. ": empty/non-string response"
+				end
+			else
+				lastError = tostring(response)
+			end
+
+			if attempt < RemoteDecompilerRetries then
+				task.wait(math.min(2 ^ (attempt - 1) * 0.5, 3))
+			end
+		end
+
+		return false, lastError
+	end
+
+	local function readScriptBytecode(script)
+		if not getbytecode then
+			return false, nil, "getscriptbytecode unavailable"
+		end
+
+		local ok, bytecode = getbytecode(script)
+		if not ok then
+			return false, nil, tostring(bytecode)
+		end
+
+		if type(bytecode) ~= "string" or bytecode == "" then
+			return false, nil, "script bytecode is empty"
+		end
+
+		return true, bytecode
+	end
+
+	local function callExecutorDecompiler(script)
+		if type(ExecutorDecompile) ~= "function" then
+			return false, "executor decompiler unavailable"
+		end
+
+		local ok, result = pcall(ExecutorDecompile, script)
+		if not ok then
+			return false, tostring(result)
+		end
+
+		local bad, reason = isBadDecompilerOutput(result)
+		if bad then
+			return false, tostring(reason) .. ": " .. tostring(result)
+		end
+
+		return true, result
+	end
+
+	local function decompileScript(script, existingBytecode)
+		local bytecode = existingBytecode
+		local bytecodeError
+
+		if not bytecode and getbytecode then
+			local ok, result, err = readScriptBytecode(script)
+			if ok then
+				bytecode = result
+			else
+				bytecodeError = err
+			end
+		end
+
+		local failures = {}
+
+		local function tryRemote()
+			if not bytecode then
+				failures[#failures + 1] = "remote: " .. tostring(bytecodeError or "no bytecode")
+				return nil
+			end
+
+			local ok, result = decompileBytecodeViaRemote(bytecode)
+			if ok then
+				return result
+			end
+
+			failures[#failures + 1] = "remote: " .. tostring(result)
+			return nil
+		end
+
+		local function tryExecutor()
+			local ok, result = callExecutorDecompiler(script)
+			if ok then
+				return result
+			end
+
+			failures[#failures + 1] = "executor: " .. tostring(result)
+			return nil
+		end
+
+		local result
+		if PreferRemoteDecompiler then
+			result = tryRemote() or tryExecutor()
+		else
+			result = tryExecutor() or tryRemote()
+		end
+
+		if result then
+			return result
+		end
+
+		local failureText =
+			"--[[ Failed to decompile.\n"
+			.. table.concat(failures, "\n")
+			.. "\n]]"
+
+		if SaveBytecodeOnDecompileFailure and bytecode then
+			local ok, encoded = pcall(base64encode, bytecode)
+			if ok and type(encoded) == "string" and encoded ~= "" then
+				failureText ..=
+					"\n\n-- Bytecode fallback (Base64):\n-- "
+					.. encoded
+					.. "\n"
+			end
+		end
+
+		return failureText
+	end
+
 	do
 		if not OPTIONS.Decompile then
 			ldecompile = function()
 				return "-- Decompiling is disabled"
 			end
-		elseif decompile then
-			local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
+		elseif getscriptbytecode or type(ExecutorDecompile) == "function" then
+			local decomp = makeTimeoutHandler(
+				OPTIONS.DecompileTimeout,
+				decompileScript,
+				"Decompiler timed out"
+			)
 
 			ldecompile = function(script)
-				-- local name = scr.ClassName .. scr.Name
 				local bytecode
-				if ScriptCache then
-					local s
-					s, bytecode = getbytecode(script)
-					local cached
 
-					if s then
+				if ScriptCache and getbytecode then
+					local success
+					success, bytecode = getbytecode(script)
+
+					if success then
 						if not bytecode or bytecode == "" then
 							return "-- The Script is Empty"
 						end
-						cached = ldeccache[bytecode]
+
+						local cached = ldeccache[bytecode]
+						if cached then
+							if __DEBUG_MODE then
+								__DEBUG_MODE("Found in Cache", script:GetFullName())
+							end
+							return cached
+						end
 					else
 						bytecode = nil
 					end
-
-					if cached then
-						if __DEBUG_MODE then
-							__DEBUG_MODE("Found in Cache", script:GetFullName())
-						end
-						return cached
-					end
-				else
-					if DecompileJobless then
-						return "-- Not found in already decompiled ScriptCache"
-					end
-
-					-- task.wait() -- TODO Maybe remove?
+				elseif DecompileJobless then
+					return "-- Not found in already decompiled ScriptCache"
 				end
 
-				local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
+				local ok, result = run_with_loading(
+					"Decompiling " .. script.Name,
+					true,
+					nil,
+					decomp,
+					script,
+					bytecode
+				)
+
 				if not result then
 					ok, result = false, "Empty Output"
 				end
 
 				local output
 				if ok then
-					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
+					result = string.gsub(tostring(result), "\0", "\\0")
 					output = result
 				else
-					output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
-				end
+					output = "--[[ Failed to decompile. Reason:\n" .. tostring(result or "") .. "\n]]"
 
-				if ScriptCache and bytecode then -- TODO there might(?) be an edgecase where it manages to decompile (built-in) even though getscriptbytecode failed, and the output won't get cached
-					ldeccache[bytecode] = output -- ? Should we cache even if it timed out?
+					if SaveBytecodeOnDecompileFailure and bytecode then
+						local encodedOk, encoded = pcall(base64encode, bytecode)
+						if encodedOk and type(encoded) == "string" and encoded ~= "" then
+							output ..=
+								"\n\n-- Bytecode fallback (Base64):\n-- "
+								.. encoded
+								.. "\n"
+						end
+					end
+
+				if ScriptCache and bytecode then
+					ldeccache[bytecode] = output
 					if __DEBUG_MODE then
 						__DEBUG_MODE("Cached", script:GetFullName())
 					end
@@ -4361,7 +4694,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		else
 			ldecompile = function()
-				return "-- Your Executor does NOT have a Decompiler"
+				return "-- Your Executor does NOT expose a decompiler or getscriptbytecode"
 			end
 		end
 	end
