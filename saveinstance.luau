@@ -3418,6 +3418,10 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field scriptcache boolean -- Use decompiled script cache to avoid decompiling duplicate scripts. ___Default:___ true
 --- @field DecompileTimeout number -- If the decompilation run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 10
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
+--- @field LocalDecompiler boolean -- Uses a locally running LunaUX decompiler server. This avoids Xeno's HTTPS/SSL proxy failures. ___Default:___ true
+--- @field LocalDecompilerUrl string -- Local LunaUX endpoint. ___Default:___ "http://127.0.0.1:8000/decompile"
+--- @field LocalDecompilerRequestTimeout number -- Timeout for a single local decompiler request. ___Default:___ 30
+--- @field PreferLocalDecompiler boolean -- Uses the local bytecode decompiler before executor/remote decompilers. Defaults true automatically on Xeno. ___Default:___ false
 --- @field RemoteDecompiler boolean -- Falls back to a bytecode decompiler API when the executor decompiler is missing or returns an error page/message. ___Default:___ true
 --- @field RemoteDecompilerUrl string -- Bytecode decompiler API endpoint. ___Default:___ "https://api.lua.expert/decompile"
 --- @field RemoteDecompilerRequestsPerMinute number -- Client-side request pacing limit. Kept below the provider limit. ___Default:___ 450
@@ -3544,6 +3548,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		-- decomptype = "",
 		DecompileTimeout = 30,
 		BytecodeTimeout = 3,
+		LocalDecompiler = true,
+		LocalDecompilerUrl = "http://127.0.0.1:8000/decompile",
+		LocalDecompilerRequestTimeout = 30,
+		PreferLocalDecompiler = false,
 		RemoteDecompiler = true,
 		RemoteDecompilerUrl = "https://api.lua.expert/decompile",
 		RemoteDecompilerRequestsPerMinute = 450,
@@ -4324,6 +4332,13 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		or (type(syn) == "table" and syn.request)
 		or (type(http) == "table" and http.request)
 
+	local LocalDecompilerEnabled = OPTIONS.LocalDecompiler ~= false
+	local LocalDecompilerUrl = tostring(OPTIONS.LocalDecompilerUrl or "http://127.0.0.1:8000/decompile")
+	local LocalDecompilerTimeout = math.max(1, tonumber(OPTIONS.LocalDecompilerRequestTimeout) or 30)
+	local PreferLocalDecompiler =
+		OPTIONS.PreferLocalDecompiler == true
+		or string.find(string.lower(EXECUTOR_NAME), "xeno", 1, true) ~= nil
+
 	local RemoteDecompilerEnabled = OPTIONS.RemoteDecompiler ~= false
 	local RemoteDecompilerUrl = tostring(OPTIONS.RemoteDecompilerUrl or "https://api.lua.expert/decompile")
 	local RemoteDecompilerRPM = math.max(1, tonumber(OPTIONS.RemoteDecompilerRequestsPerMinute) or 450)
@@ -4405,7 +4420,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	end
 
-	local function callRequestWithTimeout(options)
+	local function callRequestWithTimeout(options, timeoutSeconds, timeoutLabel)
 		if type(HttpRequest) ~= "function" then
 			return false, "executor does not expose request/http_request"
 		end
@@ -4418,13 +4433,13 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			settled = true
 		end)
 
-		local deadline = os.clock() + RemoteDecompilerTimeout
+		local deadline = os.clock() + (timeoutSeconds or RemoteDecompilerTimeout)
 		while not settled and os.clock() < deadline do
 			task.wait(0.03)
 		end
 
 		if not settled then
-			return false, "remote decompiler request timed out"
+			return false, tostring(timeoutLabel or "decompiler") .. " request timed out"
 		end
 
 		if not packed[1] then
@@ -4432,6 +4447,82 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 
 		return true, packed[2]
+	end
+
+	local function decompileBytecodeViaLocal(bytecode, scriptName)
+		if not LocalDecompilerEnabled then
+			return false, "local decompiler disabled"
+		end
+
+		if type(HttpRequest) ~= "function" then
+			return false, "executor does not expose request/http_request"
+		end
+
+		if type(bytecode) ~= "string" or bytecode == "" then
+			return false, "script bytecode is empty"
+		end
+
+		local encodedBytecode
+		local ok, result = pcall(base64encode, bytecode)
+		if ok and type(result) == "string" and result ~= "" then
+			encodedBytecode = result
+		else
+			return false, "failed to Base64 encode bytecode"
+		end
+
+		local body = service.HttpService:JSONEncode({
+			bytecode = encodedBytecode,
+			filename = tostring(scriptName or "script"),
+		})
+
+		local requestOk, response = callRequestWithTimeout({
+			Url = LocalDecompilerUrl,
+			Method = "POST",
+			Headers = {
+				["Content-Type"] = "application/json",
+				["Accept"] = "text/plain",
+			},
+			Body = body,
+		}, LocalDecompilerTimeout, "local decompiler")
+
+		if not requestOk then
+			return false, tostring(response)
+		end
+
+		local status, responseBody, success = normalizeHttpResponse(response)
+
+		if type(response) == "string" then
+			responseBody = response
+			status = 200
+			success = true
+		end
+
+		if
+			(status == nil or (status >= 200 and status < 300))
+			and success ~= false
+			and type(responseBody) == "string"
+		then
+			local bad, reason = isBadDecompilerOutput(responseBody)
+			if not bad then
+				return true, responseBody
+			end
+			return false, tostring(reason) .. ": " .. responseBody
+		end
+
+		local message
+		if type(response) == "table" then
+			message =
+				response.StatusMessage
+				or response.statusMessage
+				or response.Message
+				or response.message
+		end
+
+		return false,
+			"HTTP "
+			.. tostring(status or "?")
+			.. ": "
+			.. tostring(message or responseBody or "empty response")
 	end
 
 	local function decompileBytecodeViaRemote(bytecode)
@@ -4472,7 +4563,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					["accept"] = "text/plain",
 				},
 				Body = body,
-			})
+			}, RemoteDecompilerTimeout, "remote decompiler")
 
 			if requestOk then
 				local status, responseBody, success = normalizeHttpResponse(response)
@@ -4561,6 +4652,21 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		local failures = {}
 
+		local function tryLocal()
+			if not bytecode then
+				failures[#failures + 1] = "local: " .. tostring(bytecodeError or "no bytecode")
+				return nil
+			end
+
+			local ok, result = decompileBytecodeViaLocal(bytecode, script.Name)
+			if ok then
+				return result
+			end
+
+			failures[#failures + 1] = "local: " .. tostring(result)
+			return nil
+		end
+
 		local function tryRemote()
 			if not bytecode then
 				failures[#failures + 1] = "remote: " .. tostring(bytecodeError or "no bytecode")
@@ -4587,10 +4693,19 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 
 		local result
-		if PreferRemoteDecompiler then
-			result = tryRemote() or tryExecutor()
+		if PreferLocalDecompiler then
+			result = tryLocal()
+			if not result then
+				if PreferRemoteDecompiler then
+					result = tryRemote() or tryExecutor()
+				else
+					result = tryExecutor() or tryRemote()
+				end
+			end
+		elseif PreferRemoteDecompiler then
+			result = tryRemote() or tryExecutor() or tryLocal()
 		else
-			result = tryExecutor() or tryRemote()
+			result = tryExecutor() or tryLocal() or tryRemote()
 		end
 
 		if result then
