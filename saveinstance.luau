@@ -3471,6 +3471,12 @@ local GLOBAL_ENV = getgenv and getgenv() or _G or shared
 --- @field UnionVoxelMaxSamples number -- Per-union safety limit. Resolution is automatically increased for large unions to stay below this sample count. ___Default:___ 50000
 --- @field UnionVoxelMaxParts number -- Per-union merged-part safety limit. If exceeded, the exporter falls back to the normal placeholder Part. ___Default:___ 5000
 --- @field MarkVoxelUnionsForStudioRestore boolean -- Adds a marker to voxel-reconstructed PartOperations so USSI_RestoreVoxelUnions_Studio.lua can turn them into real UnionOperation instances in Studio. ___Default:___ true
+--- @field UnionVoxelSaveNegativeRegions boolean -- Also saves merged empty voxel regions so Studio can rebuild cutouts with SubtractAsync instead of only UnionAsync. ___Default:___ true
+--- @field UnionVoxelCSGStrategy string -- Studio restore strategy: "auto", "subtract", or "union". "auto" uses subtraction when the negative representation is cheaper. ___Default:___ "auto"
+--- @field UnionPrimitiveFallback boolean -- Before voxel CSG reconstruction, tries to recognize simple inaccessible PartOperations as WedgePart or CornerWedgePart. ___Default:___ true
+--- @field UnionPrimitiveMatchThreshold number -- Required sampled occupancy match for WedgePart/CornerWedgePart recognition. ___Default:___ 0.995
+--- @field UnionPrimitiveMaxSamples number -- Maximum coarse samples used when testing each primitive orientation. ___Default:___ 2048
+--- @field UnionPrimitiveCornerWedges boolean -- Also tests CornerWedgePart in addition to WedgePart. ___Default:___ true
 
 --- @interface OptionsAliases
 --- @within SynSaveInstance
@@ -3664,6 +3670,12 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		UnionVoxelMaxSamples = 50000,
 		UnionVoxelMaxParts = 5000,
 		MarkVoxelUnionsForStudioRestore = true,
+		UnionVoxelSaveNegativeRegions = true,
+		UnionVoxelCSGStrategy = "auto",
+		UnionPrimitiveFallback = true,
+		UnionPrimitiveMatchThreshold = 0.995,
+		UnionPrimitiveMaxSamples = 2048,
+		UnionPrimitiveCornerWedges = true,
 		AlternativeWritefile = not arrayToDict({ "WRD", "Xeno", "Zorara" })[EXECUTOR_NAME],
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
@@ -3973,6 +3985,12 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local UnionVoxelMaxSamples = math.max(64, math.floor(tonumber(OPTIONS.UnionVoxelMaxSamples) or 50000))
 	local UnionVoxelMaxParts = math.max(1, math.floor(tonumber(OPTIONS.UnionVoxelMaxParts) or 5000))
 	local MarkVoxelUnionsForStudioRestore = OPTIONS.MarkVoxelUnionsForStudioRestore ~= false
+	local UnionVoxelSaveNegativeRegions = OPTIONS.UnionVoxelSaveNegativeRegions ~= false
+	local UnionVoxelCSGStrategy = string.lower(tostring(OPTIONS.UnionVoxelCSGStrategy or "auto"))
+	local UnionPrimitiveFallback = OPTIONS.UnionPrimitiveFallback ~= false
+	local UnionPrimitiveMatchThreshold = math.clamp(tonumber(OPTIONS.UnionPrimitiveMatchThreshold) or 0.995, 0.80, 1)
+	local UnionPrimitiveMaxSamples = math.max(64, math.floor(tonumber(OPTIONS.UnionPrimitiveMaxSamples) or 2048))
+	local UnionPrimitiveCornerWedges = OPTIONS.UnionPrimitiveCornerWedges ~= false
 	local GeneratedGeometryInstances = {}
 	local VoxelizedUnionCount = 0
 
@@ -5153,6 +5171,224 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return resolution, nx, ny, nz
 	end
 
+
+	local primitiveOrientationCache
+
+	local function getPrimitiveOrientations()
+		if primitiveOrientationCache then
+			return primitiveOrientationCache
+		end
+
+		local result = {}
+		local seen = {}
+		local quarterTurn = math.pi / 2
+
+		local function rounded(value)
+			return math.floor(value * 1000 + (value >= 0 and 0.5 or -0.5))
+		end
+
+		for rx = 0, 3 do
+			for ry = 0, 3 do
+				for rz = 0, 3 do
+					local rotation = CFrame.Angles(
+						rx * quarterTurn,
+						ry * quarterTurn,
+						rz * quarterTurn
+					)
+
+					local components = { rotation:GetComponents() }
+					local keyParts = {}
+
+					for i = 4, 12 do
+						keyParts[#keyParts + 1] = tostring(rounded(components[i]))
+					end
+
+					local key = table.concat(keyParts, ",")
+
+					if not seen[key] then
+						seen[key] = true
+						result[#result + 1] = rotation
+					end
+				end
+			end
+		end
+
+		primitiveOrientationCache = result
+		return result
+	end
+
+	local function rotatedPrimitiveSize(originalSize, rotation)
+		local right = rotation.RightVector
+		local up = rotation.UpVector
+		local look = rotation.LookVector
+
+		local function mappedSize(axis)
+			return
+				math.abs(axis.X) * originalSize.X
+				+ math.abs(axis.Y) * originalSize.Y
+				+ math.abs(axis.Z) * originalSize.Z
+		end
+
+		return Vector3.new(
+			mappedSize(right),
+			mappedSize(up),
+			mappedSize(look)
+		)
+	end
+
+	local function copyVisualBasePartProperties(source, destination)
+		destination.Anchored = source.Anchored
+		destination.CanCollide = source.CanCollide
+		destination.CanTouch = source.CanTouch
+		destination.CanQuery = source.CanQuery
+		destination.CastShadow = source.CastShadow
+		destination.Color = source.Color
+		destination.Material = source.Material
+		destination.Reflectance = source.Reflectance
+		destination.Transparency = source.Transparency
+		destination.Massless = source.Massless
+
+		pcall(function()
+			destination.CollisionGroup = source.CollisionGroup
+		end)
+
+		pcall(function()
+			destination.CustomPhysicalProperties = source.CustomPhysicalProperties
+		end)
+	end
+
+	local function tryFitPrimitive(
+		instance,
+		size,
+		nx,
+		ny,
+		nz,
+		cellSize,
+		occupied,
+		linearIndex
+	)
+		if not UnionPrimitiveFallback then
+			return nil
+		end
+
+		local sampleCount = nx * ny * nz
+		local stride = math.max(1, math.ceil(sampleCount / UnionPrimitiveMaxSamples))
+		local orientations = getPrimitiveOrientations()
+
+		local classes = { "WedgePart" }
+		if UnionPrimitiveCornerWedges then
+			classes[#classes + 1] = "CornerWedgePart"
+		end
+
+		local bestClass
+		local bestRotation
+		local bestScore = 0
+		local bestCompared = 0
+
+		for _, className in ipairs(classes) do
+			local candidate = Instance.new(className)
+			candidate.Name = "__USSI_PrimitiveProbe"
+			candidate.Anchored = true
+			candidate.CanCollide = false
+			candidate.CanTouch = false
+			candidate.CanQuery = false
+			candidate.CastShadow = false
+			candidate.Transparency = 1
+			candidate.Parent = workspace
+
+			for _, rotation in ipairs(orientations) do
+				candidate.Size = rotatedPrimitiveSize(size, rotation)
+				candidate.CFrame = instance.CFrame * rotation
+
+				local matches = 0
+				local compared = 0
+				local flatIndex = 0
+
+				for y = 1, ny do
+					for z = 1, nz do
+						for x = 1, nx do
+							flatIndex += 1
+
+							if flatIndex % stride == 0 then
+								local localPosition = Vector3.new(
+									-size.X / 2 + (x - 0.5) * cellSize.X,
+									-size.Y / 2 + (y - 0.5) * cellSize.Y,
+									-size.Z / 2 + (z - 0.5) * cellSize.Z
+								)
+
+								local worldPosition =
+									instance.CFrame:PointToWorldSpace(localPosition)
+
+								local ok, closest =
+									pcall(
+										candidate.GetClosestPointOnSurface,
+										candidate,
+										worldPosition
+									)
+
+								local candidateOccupied =
+									ok
+									and (closest - worldPosition).Magnitude
+										<= UnionVoxelEpsilon
+
+								if
+									candidateOccupied
+									== occupied[linearIndex(x, y, z)]
+								then
+									matches += 1
+								end
+
+								compared += 1
+							end
+						end
+					end
+				end
+
+				local score = compared > 0 and matches / compared or 0
+
+				if score > bestScore then
+					bestScore = score
+					bestClass = className
+					bestRotation = rotation
+					bestCompared = compared
+				end
+
+				if score >= UnionPrimitiveMatchThreshold then
+					break
+				end
+			end
+
+			candidate:Destroy()
+
+			if bestScore >= UnionPrimitiveMatchThreshold then
+				break
+			end
+		end
+
+		if
+			not bestClass
+			or not bestRotation
+			or bestScore < UnionPrimitiveMatchThreshold
+		then
+			return nil
+		end
+
+		local primitive = Instance.new(bestClass)
+		primitive.Name = "__USSI_Primitive"
+		primitive.Size = rotatedPrimitiveSize(size, bestRotation)
+		primitive.CFrame = instance.CFrame * bestRotation
+		copyVisualBasePartProperties(instance, primitive)
+
+		GeneratedGeometryInstances[#GeneratedGeometryInstances + 1] = primitive
+
+		return {
+			part = primitive,
+			className = bestClass,
+			score = bestScore,
+			compared = bestCompared,
+		}
+	end
+
 	local function voxelizePartOperation(instance)
 		local size = instance.Size
 		local _, nx, ny, nz = calculateVoxelGrid(size)
@@ -5199,82 +5435,142 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			return nil, "no occupied samples"
 		end
 
-		local visited = table.create(nx * ny * nz, false)
-		local boxes = {}
+		local primitive = tryFitPrimitive(
+			instance,
+			size,
+			nx,
+			ny,
+			nz,
+			cellSize,
+			occupied,
+			linearIndex
+		)
 
-		-- Greedy 3-D cuboid packing. This is substantially smaller than saving
-		-- one Part per occupied sample and preserves the voxel silhouette.
-		for y = 1, ny do
-			for z = 1, nz do
-				for x = 1, nx do
-					local firstIndex = linearIndex(x, y, z)
-					if occupied[firstIndex] and not visited[firstIndex] then
-						local x2 = x
-						while x2 + 1 <= nx do
-							local idx = linearIndex(x2 + 1, y, z)
-							if not occupied[idx] or visited[idx] then
-								break
-							end
-							x2 += 1
-						end
+		if primitive then
+			return {
+				parts = {},
+				negativeParts = {},
+				bounds = nil,
+				primitive = primitive,
+				occupiedCount = occupiedCount,
+				emptyCount = (nx * ny * nz) - occupiedCount,
+				sampleCount = nx * ny * nz,
+				cellSize = cellSize,
+				grid = Vector3.new(nx, ny, nz),
+				positiveBoxes = 0,
+				negativeBoxes = 0,
+			}
+		end
 
-						local z2 = z
-						while z2 + 1 <= nz do
-							local canExpand = true
-							for tx = x, x2 do
-								local idx = linearIndex(tx, y, z2 + 1)
-								if not occupied[idx] or visited[idx] then
-									canExpand = false
+		local function packCells(expectedOccupied, maxBoxes)
+			local visited = table.create(nx * ny * nz, false)
+			local boxes = {}
+
+			for y = 1, ny do
+				for z = 1, nz do
+					for x = 1, nx do
+						local firstIndex = linearIndex(x, y, z)
+
+						if occupied[firstIndex] == expectedOccupied and not visited[firstIndex] then
+							local x2 = x
+
+							while x2 + 1 <= nx do
+								local idx = linearIndex(x2 + 1, y, z)
+								if occupied[idx] ~= expectedOccupied or visited[idx] then
 									break
 								end
+								x2 += 1
 							end
-							if not canExpand then
-								break
-							end
-							z2 += 1
-						end
 
-						local y2 = y
-						while y2 + 1 <= ny do
-							local canExpand = true
-							for tz = z, z2 do
+							local z2 = z
+
+							while z2 + 1 <= nz do
+								local canExpand = true
+
 								for tx = x, x2 do
-									local idx = linearIndex(tx, y2 + 1, tz)
-									if not occupied[idx] or visited[idx] then
+									local idx = linearIndex(tx, y, z2 + 1)
+									if occupied[idx] ~= expectedOccupied or visited[idx] then
 										canExpand = false
 										break
 									end
 								end
+
 								if not canExpand then
 									break
 								end
-							end
-							if not canExpand then
-								break
-							end
-							y2 += 1
-						end
 
-						for ty = y, y2 do
-							for tz = z, z2 do
-								for tx = x, x2 do
-									visited[linearIndex(tx, ty, tz)] = true
+								z2 += 1
+							end
+
+							local y2 = y
+
+							while y2 + 1 <= ny do
+								local canExpand = true
+
+								for tz = z, z2 do
+									for tx = x, x2 do
+										local idx = linearIndex(tx, y2 + 1, tz)
+										if occupied[idx] ~= expectedOccupied or visited[idx] then
+											canExpand = false
+											break
+										end
+									end
+
+									if not canExpand then
+										break
+									end
+								end
+
+								if not canExpand then
+									break
+								end
+
+								y2 += 1
+							end
+
+							for ty = y, y2 do
+								for tz = z, z2 do
+									for tx = x, x2 do
+										visited[linearIndex(tx, ty, tz)] = true
+									end
 								end
 							end
-						end
 
-						boxes[#boxes + 1] = { x, y, z, x2, y2, z2 }
-						if #boxes > UnionVoxelMaxParts then
-							return nil, "merged part count exceeded " .. tostring(UnionVoxelMaxParts)
+							boxes[#boxes + 1] = { x, y, z, x2, y2, z2 }
+
+							if maxBoxes and #boxes > maxBoxes then
+								return nil, "merged box count exceeded " .. tostring(maxBoxes)
+							end
 						end
 					end
 				end
 			end
+
+			return boxes
 		end
 
-		local generated = table.create(#boxes)
+		local boxes, boxError = packCells(true, UnionVoxelMaxParts)
+		if not boxes then
+			return nil, boxError
+		end
 
-		for i, box in ipairs(boxes) do
+		local negativeBoxes = {}
+
+		if UnionVoxelSaveNegativeRegions then
+			local packedNegative, negativeError = packCells(false, UnionVoxelMaxParts)
+
+			if packedNegative then
+				negativeBoxes = packedNegative
+			elseif __DEBUG_MODE then
+				__DEBUG_MODE(
+					"Negative voxel packing skipped",
+					instance:GetFullName(),
+					negativeError
+				)
+			end
+		end
+
+		local function boxToPart(box, name, isNegative)
 			local x1, y1, z1, x2, y2, z2 =
 				box[1], box[2], box[3], box[4], box[5], box[6]
 
@@ -5285,7 +5581,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			)
 
 			local part = Instance.new("Part")
-			part.Name = "__USSI_Voxel"
+			part.Name = name
 			part.Size = Vector3.new(
 				(x2 - x1 + 1) * cellSize.X,
 				(y2 - y1 + 1) * cellSize.Y,
@@ -5293,35 +5589,71 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			)
 			part.CFrame = instance.CFrame * CFrame.new(center)
 
-			part.Anchored = instance.Anchored
-			part.CanCollide = instance.CanCollide
-			part.CanTouch = instance.CanTouch
-			part.CanQuery = instance.CanQuery
-			part.CastShadow = instance.CastShadow
-			part.Color = instance.Color
-			part.Material = instance.Material
-			part.Reflectance = instance.Reflectance
-			part.Transparency = instance.Transparency
-			part.Massless = instance.Massless
+			if isNegative then
+				part.Anchored = true
+				part.CanCollide = false
+				part.CanTouch = false
+				part.CanQuery = false
+				part.CastShadow = false
+				part.Transparency = 1
+			else
+				part.Anchored = instance.Anchored
+				part.CanCollide = instance.CanCollide
+				part.CanTouch = instance.CanTouch
+				part.CanQuery = instance.CanQuery
+				part.CastShadow = instance.CastShadow
+				part.Color = instance.Color
+				part.Material = instance.Material
+				part.Reflectance = instance.Reflectance
+				part.Transparency = instance.Transparency
+				part.Massless = instance.Massless
 
-			pcall(function()
-				part.CollisionGroup = instance.CollisionGroup
-			end)
+				pcall(function()
+					part.CollisionGroup = instance.CollisionGroup
+				end)
 
-			pcall(function()
-				part.CustomPhysicalProperties = instance.CustomPhysicalProperties
-			end)
+				pcall(function()
+					part.CustomPhysicalProperties = instance.CustomPhysicalProperties
+				end)
+			end
 
 			GeneratedGeometryInstances[#GeneratedGeometryInstances + 1] = part
-			generated[i] = part
+			return part
 		end
+
+		local generated = table.create(#boxes)
+		for i, box in ipairs(boxes) do
+			generated[i] = boxToPart(box, "__USSI_Voxel", false)
+		end
+
+		local generatedNegative = table.create(#negativeBoxes)
+		for i, box in ipairs(negativeBoxes) do
+			generatedNegative[i] = boxToPart(box, "__USSI_NegativeVoxel", true)
+		end
+
+		local bounds = Instance.new("Part")
+		bounds.Name = "__USSI_Bounds"
+		bounds.Size = size
+		bounds.CFrame = instance.CFrame
+		bounds.Anchored = true
+		bounds.CanCollide = false
+		bounds.CanTouch = false
+		bounds.CanQuery = false
+		bounds.CastShadow = false
+		bounds.Transparency = 1
+		GeneratedGeometryInstances[#GeneratedGeometryInstances + 1] = bounds
 
 		return {
 			parts = generated,
+			negativeParts = generatedNegative,
+			bounds = bounds,
 			occupiedCount = occupiedCount,
+			emptyCount = (nx * ny * nz) - occupiedCount,
 			sampleCount = nx * ny * nz,
 			cellSize = cellSize,
 			grid = Vector3.new(nx, ny, nz),
+			positiveBoxes = #generated,
+			negativeBoxes = #generatedNegative,
 		}
 	end
 
@@ -5354,30 +5686,68 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			local marker = Instance.new("StringValue")
 			marker.Name = "__USSI_VoxelUnionMarker"
 			marker.Value = instance.ClassName
+			marker:SetAttribute("CSGStrategy", UnionVoxelCSGStrategy)
+			marker:SetAttribute("PositiveBoxes", result.positiveBoxes)
+			marker:SetAttribute("NegativeBoxes", result.negativeBoxes)
+			marker:SetAttribute("OccupiedSamples", result.occupiedCount)
+			marker:SetAttribute("TotalSamples", result.sampleCount)
+
+			if result.primitive then
+				marker:SetAttribute("PrimitiveClass", result.primitive.className)
+				marker:SetAttribute("PrimitiveMatch", result.primitive.score)
+			end
 
 			GeneratedGeometryInstances[#GeneratedGeometryInstances + 1] = marker
 			children[#children + 1] = marker
 		end
 
-		for _, child in result.parts do
-			children[#children + 1] = child
+		if result.primitive then
+			children[#children + 1] = result.primitive.part
+		else
+			if result.bounds then
+				children[#children + 1] = result.bounds
+			end
+
+			for _, child in result.parts do
+				children[#children + 1] = child
+			end
+
+			for _, child in result.negativeParts do
+				children[#children + 1] = child
+			end
 		end
+
 		override.__Children = children
 
 		VoxelizedUnionCount += 1
 		if VoxelizedUnionCount <= 10 or VoxelizedUnionCount % 25 == 0 then
-			print(
-				"[Geometry] Voxelized PartOperation:",
-				instance:GetFullName(),
-				"| samples:",
-				result.sampleCount,
-				"| occupied:",
-				result.occupiedCount,
-				"| merged parts:",
-				#result.parts,
-				"| cell:",
-				result.cellSize
-			)
+			if result.primitive then
+				print(
+					"[Geometry] Recognized PartOperation primitive:",
+					instance:GetFullName(),
+					"->",
+					result.primitive.className,
+					"| match:",
+					string.format("%.4f", result.primitive.score),
+					"| samples:",
+					result.primitive.compared
+				)
+			else
+				print(
+					"[Geometry] Voxelized PartOperation:",
+					instance:GetFullName(),
+					"| samples:",
+					result.sampleCount,
+					"| occupied:",
+					result.occupiedCount,
+					"| positive:",
+					#result.parts,
+					"| negative:",
+					#result.negativeParts,
+					"| cell:",
+					result.cellSize
+				)
+			end
 		end
 
 		return true, override, result
